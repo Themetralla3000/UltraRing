@@ -144,6 +144,16 @@ foreach ($Name in 'UltraRing.Ultrakill.dll', 'UltraRing.Link.dll') {
 $Pdb = Join-Path $Out 'UltraRing.Ultrakill.pdb'
 if (Test-Path -LiteralPath $Pdb) { Copy-Item -LiteralPath $Pdb -Destination $StagePlugin -Force }
 
+# ULTRAKILL modding convention: hide the BepInEx manager object, otherwise objects created by plugins before the
+# first scene do not survive it.
+$BepCfg = Join-Path $Stage 'BepInEx\config\BepInEx.cfg'
+if (Test-Path -LiteralPath $BepCfg) {
+    $Text = [IO.File]::ReadAllText($BepCfg) -replace 'HideManagerGameObject = false', 'HideManagerGameObject = true'
+    [IO.File]::WriteAllText($BepCfg, $Text)
+} else {
+    [IO.File]::WriteAllText($BepCfg, "[Chainloader]`r`n`r`nHideManagerGameObject = true`r`n")
+}
+
 Write-Host ''
 Write-Host 'Build finished.' -ForegroundColor Green
 Write-Host "  host DLLs : $McDir\dist"

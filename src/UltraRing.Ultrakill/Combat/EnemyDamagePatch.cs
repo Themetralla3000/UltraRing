@@ -90,8 +90,9 @@ namespace UltraRing.Ultrakill.Combat
                 // --- death: the host decides for real, this is the local reaction (kill streak, "arsenal" style) ---
                 if (killed)
                 {
+                    // EnemyIdentifier.Death/ProcessDeath expect a real Enemy brain (NRE on proxies); the host plays the
+                    // real death, the proxy just stops taking hits until the host confirms or revives it.
                     proxy.OnLocalDeath();
-                    eid.Death(fromExplosion);
                 }
             }
             finally

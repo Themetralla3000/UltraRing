@@ -3,6 +3,8 @@ using BepInEx.Logging;
 using HarmonyLib;
 using UltraRing.Link;
 using UnityEngine;
+using UnityEngine.SceneManagement;
+using Object = UnityEngine.Object;
 
 namespace UltraRing.Ultrakill
 {
@@ -30,11 +32,25 @@ namespace UltraRing.Ultrakill
             ApplyRenderSettings();
             new Harmony(Guid).PatchAll(typeof(Plugin).Assembly);
 
+            // The chainloader runs before ULTRAKILL's first scene; objects made this early do not survive it.
+            // A static scene hook does, so the session is (re)created from there.
+            _link = new GuestLink();
+            SceneManager.sceneLoaded += OnSceneLoadedStatic;
+            Log.LogInfo($"UltraRing {Version}: bridge dir {BridgePaths.Dir}");
+        }
+
+        private static GuestLink _link;
+
+        private static void OnSceneLoadedStatic(Scene scene, LoadSceneMode mode)
+        {
+            if (BridgeSession.Instance != null) return; // alive (Unity null check); it handles scenes itself
             var go = new GameObject("UltraRing Session");
             go.AddComponent<BridgeMarker>();
-            DontDestroyOnLoad(go);
-            go.AddComponent<BridgeSession>().Init(new GuestLink());
-            Log.LogInfo($"UltraRing {Version}: bridge dir {BridgePaths.Dir}");
+            Object.DontDestroyOnLoad(go);
+            var session = go.AddComponent<BridgeSession>();
+            session.Init(_link);
+            Log.LogInfo($"Bridge session created on scene '{scene.name}'.");
+            session.HandleSceneLoaded(scene, mode);
         }
 
         private static void ApplyRenderSettings()

@@ -76,10 +76,15 @@ namespace UltraRing.Ultrakill
             SceneManager.sceneLoaded += OnSceneLoaded;
         }
 
+        /// <summary>Entry for the scene that was loading when the session was created.</summary>
+        public void HandleSceneLoaded(Scene scene, LoadSceneMode mode) => OnSceneLoaded(scene, mode);
+
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
+            Plugin.Log.LogInfo($"Scene loaded: '{SceneHelper.CurrentScene}' (unity name '{scene.name}', {mode})");
             if (mode != LoadSceneMode.Single) return; // e.g. SceneHelper's additive "<scene> - Footsteps" physics scene
-            bool bridgeScene = scene.name == LevelShell.SceneName;
+            // Addressable scenes get hashed names; SceneHelper knows the real one (set before the load starts).
+            bool bridgeScene = SceneHelper.CurrentScene == LevelShell.SceneName || scene.name == LevelShell.SceneName;
             if (bridgeScene == InBridgeScene && !bridgeScene) return;
             InBridgeScene = bridgeScene;
             ReleaseControl();
@@ -109,7 +114,7 @@ namespace UltraRing.Ultrakill
             _alive = Link.Poll();
             Link.BumpGuestHeartbeat();
             bool haveState = _alive && Link.Snapshot(out _state);
-            _overlay.Tick(Link, _state, _alive && haveState, HostMode, !Driving);
+            _overlay.Tick(Link, _state, _alive && haveState && InBridgeScene, HostMode, !Driving);
             if (!InBridgeScene) return;
 
             if (!_alive || !haveState)
@@ -387,7 +392,11 @@ namespace UltraRing.Ultrakill
 
         private void OnApplicationQuit() => Shutdown();
 
-        private void OnDestroy() => Shutdown();
+        private void OnDestroy()
+        {
+            SceneManager.sceneLoaded -= OnSceneLoaded;
+            Shutdown();
+        }
 
         private void Shutdown()
         {

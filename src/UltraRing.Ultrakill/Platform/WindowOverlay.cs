@@ -58,6 +58,7 @@ namespace UltraRing.Ultrakill.Platform
         private long _rectChangedMs;
         private int _regionW, _regionH;
         private int _alpha = -1;
+        private bool _loggedAlphaOk;
         private bool _layeredOk = true;
         private bool _fullscreenMarked;
         private long _nextTaskbarMs;
@@ -303,6 +304,13 @@ namespace UltraRing.Ultrakill.Platform
         {
             if (!IsWindowOk()) return false;
             if (IsIconic(_hwnd)) { _note = "ULTRAKILL window minimised; waiting"; return false; }
+            if (Screen.fullScreenMode != FullScreenMode.Windowed)
+            {
+                Plugin.Log.LogInfo($"Switching ULTRAKILL from {Screen.fullScreenMode} to windowed for the overlay.");
+                Screen.SetResolution(Screen.width, Screen.height, FullScreenMode.Windowed);
+                _note = "switching to windowed";
+                return false; // retry next frames once Unity has applied it
+            }
 
             // Snapshot for Restore (only when going from normal to overlay).
             _origStyle = GetStyle(_hwnd);
@@ -428,7 +436,11 @@ namespace UltraRing.Ultrakill.Platform
                 return;
             }
             SetClickThrough(drawNothing);
-            if (_alpha < 0) Plugin.Log.LogInfo($"Layered window: constant alpha {want}/255 accepted by Windows.");
+            if (!_loggedAlphaOk)
+            {
+                _loggedAlphaOk = true;
+                Plugin.Log.LogInfo($"Layered window: constant alpha {want}/255 accepted by Windows.");
+            }
             _alpha = want;
         }
 
