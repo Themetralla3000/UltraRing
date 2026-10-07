@@ -40,5 +40,6 @@ unsafe
     ErmcControl c = default;
     Check("hunterYawDeg offset", (int)((byte*)&c.hunterYawDeg - (byte*)&c), 0x58);
 }
+failures += RoundTripTests.Run();
 Console.WriteLine(failures == 0 ? "ALL OK" : $"{failures} FAILURES");
 return failures == 0 ? 0 : 1;

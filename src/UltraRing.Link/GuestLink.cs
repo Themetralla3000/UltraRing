@@ -21,7 +21,7 @@ namespace UltraRing.Link
         private long _lastOpenAttemptMs = long.MinValue;
         private ulong _lastHeartbeat;
         private bool _haveHeartbeat;
-        private long _lastHeartbeatChangeMs;
+        private long _lastHeartbeatChangeMs = long.MinValue;   // MinValue = no change observed yet
         private ErmcGameState _latest;
         private bool _hasState;
         private readonly Stopwatch _clock = Stopwatch.StartNew();
@@ -59,7 +59,7 @@ namespace UltraRing.Link
                 // A stale counter from a previous session must not count as live.
                 _lastHeartbeat = hb;
                 _haveHeartbeat = true;
-                _lastHeartbeatChangeMs = 0;
+                _lastHeartbeatChangeMs = long.MinValue;
             }
             else if (hb != _lastHeartbeat)
             {
@@ -90,7 +90,7 @@ namespace UltraRing.Link
             h->mcStartMs = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         }
 
-        public bool Alive => _b != null && _lastHeartbeatChangeMs > 0 && NowMs - _lastHeartbeatChangeMs < AliveTimeoutMs;
+        public bool Alive => _b != null && _lastHeartbeatChangeMs != long.MinValue && NowMs - _lastHeartbeatChangeMs < AliveTimeoutMs;
         public ulong HostFrame => _lastHeartbeat;
         public int HostProcessId => _b != null ? (int)Volatile.Read(ref H->hostPid) : 0;
 
@@ -102,6 +102,7 @@ namespace UltraRing.Link
 
         public bool ReadState(out ErmcGameState s)
         {
+            if (_b == null) { s = default; return false; }
             var p = (ErmcGameState*)(_b + Protocol.OffState);
             for (int tries = 0; tries < 2000; tries++)
             {
@@ -198,9 +199,18 @@ namespace UltraRing.Link
             {
                 if (_b == null) return "";
                 byte* s = H->hostPrompt;
-                int n = 0;
-                while (n < 63 && s[n] != 0) n++;
-                return n == 0 ? "" : Encoding.UTF8.GetString(s, n);
+                // The host rewrites the text between two hostPromptSeq bumps (odd = writing): re-read until stable.
+                for (int tries = 0; tries < 200; tries++)
+                {
+                    uint s1 = Volatile.Read(ref H->hostPromptSeq);
+                    if ((s1 & 1) != 0) { Thread.SpinWait(1); continue; }
+                    int n = 0;
+                    while (n < 63 && s[n] != 0) n++;
+                    string text = n == 0 ? "" : Encoding.UTF8.GetString(s, n);
+                    Thread.MemoryBarrier();
+                    if (Volatile.Read(ref H->hostPromptSeq) == s1) return text;
+                }
+                return "";
             }
         }
 
@@ -219,7 +229,8 @@ namespace UltraRing.Link
             if (_b == null || !Alive || !RaysIdle) return 0;
             ErmcRayHeader* r = Rays;
             if (filter != null) { r->filterA = filter[0]; r->filterB = filter[1]; r->filterC = filter[2]; }
-            count = Math.Min(count, Protocol.MaxRays);
+            count = Math.Min(Math.Min(count, Protocol.MaxRays), rays.Length / 6);
+            if (count <= 0) return 0;
             float* dst = (float*)(_b + Protocol.OffRays + Protocol.RaysOffRays);
             for (int i = 0; i < count * 6; i++) dst[i] = rays[i];
             r->count = (uint)count;

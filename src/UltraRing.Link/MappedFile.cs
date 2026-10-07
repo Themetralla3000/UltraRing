@@ -51,6 +51,46 @@ namespace UltraRing.Link
             return m;
         }
 
+        /// <summary>
+        /// Opens an EXISTING file only (like the host's frames.shm open: it never creates the file) and maps
+        /// <paramref name="size"/> bytes. Returns null with <paramref name="error"/> set if the file is missing or
+        /// shorter than <paramref name="size"/>.
+        /// </summary>
+        public static MappedFile OpenExisting(string path, long size, out string error)
+        {
+            error = null;
+            var m = new MappedFile(path, size);
+            m._file = CreateFileW(path, GenericRead | GenericWrite, FileShareRead | FileShareWrite, IntPtr.Zero,
+                OpenExistingDisp, FileAttributeNormal, IntPtr.Zero);
+            if (m._file == InvalidHandle)
+            {
+                error = "CreateFile(OPEN_EXISTING) failed: " + Marshal.GetLastWin32Error();
+                m.Dispose();
+                return null;
+            }
+            if (!GetFileSizeEx(m._file, out long fileSize) || fileSize < size)
+            {
+                error = "file too small: " + fileSize + " < " + size;
+                m.Dispose();
+                return null;
+            }
+            m._mapping = CreateFileMappingW(m._file, IntPtr.Zero, PageReadWrite, (uint)(size >> 32), (uint)size, null);
+            if (m._mapping == IntPtr.Zero)
+            {
+                error = "CreateFileMapping failed: " + Marshal.GetLastWin32Error();
+                m.Dispose();
+                return null;
+            }
+            m.Base = (byte*)MapViewOfFile(m._mapping, FileMapAllAccess, 0, 0, (UIntPtr)(ulong)size);
+            if (m.Base == null)
+            {
+                error = "MapViewOfFile failed: " + Marshal.GetLastWin32Error();
+                m.Dispose();
+                return null;
+            }
+            return m;
+        }
+
         public void Dispose()
         {
             if (Base != null) UnmapViewOfFile((IntPtr)Base);
@@ -63,7 +103,7 @@ namespace UltraRing.Link
 
         private const uint GenericRead = 0x80000000, GenericWrite = 0x40000000;
         private const uint FileShareRead = 1, FileShareWrite = 2;
-        private const uint OpenAlways = 4, FileAttributeNormal = 0x80;
+        private const uint OpenExistingDisp = 3, OpenAlways = 4, FileAttributeNormal = 0x80;
         private const uint PageReadWrite = 0x04, FileMapAllAccess = 0xF001F;
         private static readonly IntPtr InvalidHandle = new IntPtr(-1);
 
@@ -80,6 +120,9 @@ namespace UltraRing.Link
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool UnmapViewOfFile(IntPtr view);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileSizeEx(IntPtr file, out long size);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr handle);

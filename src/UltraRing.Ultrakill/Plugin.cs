@@ -1,5 +1,6 @@
 using BepInEx;
 using BepInEx.Logging;
+using HarmonyLib;
 using UltraRing.Link;
 using UnityEngine;
 
@@ -13,31 +14,26 @@ namespace UltraRing.Ultrakill
         public const string Version = "0.1.0";
 
         internal static ManualLogSource Log;
-        internal static GuestLink Link;
 
         private void Awake()
         {
             Log = Logger;
-            Link = new GuestLink();
-            // The host owns the final frame and usually has focus-independent input through our window;
-            // ULTRAKILL must keep simulating while another window is in front.
+            BridgeConfig.Bind(Config);
+            if (!BridgeConfig.Enabled.Value)
+            {
+                Log.LogInfo("UltraRing disabled in config.");
+                return;
+            }
+            // ULTRAKILL ships with runInBackground off: the whole player loop would stop whenever the host window
+            // has focus (F8) or is clicked.
             Application.runInBackground = true;
+            new Harmony(Guid).PatchAll(typeof(Plugin).Assembly);
+
+            var go = new GameObject("UltraRing Session");
+            go.AddComponent<BridgeMarker>();
+            DontDestroyOnLoad(go);
+            go.AddComponent<BridgeSession>().Init(new GuestLink());
             Log.LogInfo($"UltraRing {Version}: bridge dir {BridgePaths.Dir}");
         }
-
-        private bool _wasAlive;
-
-        private void Update()
-        {
-            bool alive = Link.Poll();
-            if (alive != _wasAlive)
-            {
-                _wasAlive = alive;
-                Log.LogInfo(alive ? $"Host connected (pid {Link.HostProcessId})" : "Host not running");
-            }
-            Link.BumpGuestHeartbeat();
-        }
-
-        private void OnDestroy() => Link?.Dispose();
     }
 }
