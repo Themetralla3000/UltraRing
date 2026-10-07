@@ -1,0 +1,152 @@
+<#
+.SYNOPSIS
+  Builds everything UltraRing needs: the Elden Ring host DLLs, the managed solution, and a staged BepInEx runtime
+  for ULTRAKILL at runtime\ultrakill-bepinex. Touches no game folder and starts no game.
+.PARAMETER Configuration
+  dotnet build configuration (default Release).
+.PARAMETER SkipNative
+  Do not (re)build the host DLLs.
+.PARAMETER SkipManaged
+  Do not run dotnet build (only stage what is already built).
+#>
+param(
+    [string]$Configuration = 'Release',
+    [switch]$SkipNative,
+    [switch]$SkipManaged
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$Root = Split-Path -Parent $PSScriptRoot
+$Tools = Join-Path $Root '.tools'
+
+# Pinned versions (docs/research/toolchain.md)
+$McRingUrl = 'https://github.com/siddoff/Minecraft-Ring'
+$McRingCommit = '711015afa67ab25c7b9597c68038718d1cef322e'
+$LlvmTag = '20261006'
+$LlvmName = "llvm-mingw-$LlvmTag-ucrt-x86_64"
+$LlvmUrl = "https://github.com/mstorsjo/llvm-mingw/releases/download/$LlvmTag/$LlvmName.zip"
+$LlvmSha = '317492c456aa27ee607a5919f1d2d38dcdc1112516a24d0bf4b00d078f52d17a'
+$BepVersion = '5.4.23.5'
+$BepName = "BepInEx_win_x64_$BepVersion"
+$BepUrl = "https://github.com/BepInEx/BepInEx/releases/download/v$BepVersion/$BepName.zip"
+$BepSha = '82f9878551030f54657792c0740d9d51a09500eeae1fba21106b0c441e6732c4'
+
+function Step([string]$Text) { Write-Host "==> $Text" -ForegroundColor Cyan }
+
+function Get-Download([string]$Url, [string]$Sha256, [string]$Dest) {
+    if (Test-Path -LiteralPath $Dest) {
+        if ((Get-FileHash -LiteralPath $Dest -Algorithm SHA256).Hash -ieq $Sha256) { return }
+        Remove-Item -LiteralPath $Dest -Force
+    }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $Dest) -Force | Out-Null
+    Write-Host "    downloading $Url"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    try { Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing }
+    catch { throw "Could not download $Url ($($_.Exception.Message)). Download it manually to '$Dest' and run again." }
+    $Actual = (Get-FileHash -LiteralPath $Dest -Algorithm SHA256).Hash
+    if ($Actual -ine $Sha256) {
+        Remove-Item -LiteralPath $Dest -Force
+        throw "SHA-256 mismatch for $Url (expected $Sha256, got $Actual)."
+    }
+}
+
+# ---------------------------------------------------------------- 1. host source
+$McDir = Join-Path $Root 'external\minecraft-ring'
+if (-not $SkipNative) {
+    Step 'Minecraft Ring checkout (pinned host source)'
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git was not found in PATH.' }
+    if (-not (Test-Path -LiteralPath (Join-Path $McDir '.git'))) {
+        New-Item -ItemType Directory -Path (Split-Path -Parent $McDir) -Force | Out-Null
+        & git clone $McRingUrl $McDir
+        if ($LASTEXITCODE -ne 0) { throw 'git clone of Minecraft Ring failed.' }
+    }
+    $Head = (& git -C $McDir rev-parse HEAD).Trim()
+    if ($Head -ne $McRingCommit) {
+        Write-Host "    checking out $McRingCommit (was $Head)"
+        & git -C $McDir checkout --quiet $McRingCommit
+        if ($LASTEXITCODE -ne 0) { throw "Could not check out $McRingCommit in $McDir." }
+    }
+
+    # ---------------------------------------------------------------- 2. compiler
+    Step 'LLVM-MinGW compiler'
+    $CompilerRoot = Join-Path $Tools 'compiler'
+    $Clang = @(Get-ChildItem -Path "$CompilerRoot\*\bin\clang++.exe" -ErrorAction SilentlyContinue)
+    if ($Clang.Count -eq 0) {
+        $Zip = Join-Path $Tools "downloads\llvm-mingw\$LlvmName.zip"
+        Get-Download $LlvmUrl $LlvmSha $Zip
+        New-Item -ItemType Directory -Path $CompilerRoot -Force | Out-Null
+        Write-Host '    extracting'
+        Expand-Archive -LiteralPath $Zip -DestinationPath $CompilerRoot -Force
+        $Clang = @(Get-ChildItem -Path "$CompilerRoot\*\bin\clang++.exe" -ErrorAction SilentlyContinue)
+        if ($Clang.Count -eq 0) { throw "clang++.exe not found after extracting $Zip." }
+    }
+    if ($Clang.Count -gt 1) { Write-Warning 'More than one compiler folder in .tools\compiler; build_native.py uses the first match.' }
+
+    # build_native.py looks for <its repo>\.tools\compiler\*\bin\clang++.exe: point it at ours with a junction.
+    $Junction = Join-Path $McDir '.tools\compiler'
+    if (-not (Test-Path -LiteralPath $Junction)) {
+        New-Item -ItemType Directory -Path (Split-Path -Parent $Junction) -Force | Out-Null
+        New-Item -ItemType Junction -Path $Junction -Target $CompilerRoot | Out-Null
+        Write-Host "    junction $Junction -> $CompilerRoot"
+    }
+
+    # ---------------------------------------------------------------- 3. native build
+    Step 'Host DLLs (dinput8.dll, erbridge_core.dll)'
+    $Python = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $Python) { $Python = Get-Command py -ErrorAction SilentlyContinue }
+    if (-not $Python) { throw 'Python 3 was not found in PATH (needed for build_native.py).' }
+    Push-Location $McDir
+    try {
+        & $Python.Source 'tools\build_native.py'
+        if ($LASTEXITCODE -ne 0) { throw 'build_native.py failed.' }
+    } finally { Pop-Location }
+    foreach ($Name in 'dinput8.dll', 'erbridge_core.dll') {
+        if (-not (Test-Path -LiteralPath (Join-Path $McDir "dist\$Name"))) { throw "Native build did not produce dist\$Name." }
+    }
+}
+
+# ---------------------------------------------------------------- 4. BepInEx
+Step "BepInEx $BepVersion"
+$BepDir = Join-Path $Tools 'bepinex5-x64'
+if (-not (Test-Path -LiteralPath (Join-Path $BepDir 'BepInEx\core\BepInEx.Preloader.dll'))) {
+    $Zip = Join-Path $Tools "downloads\bepinex5\$BepName.zip"
+    Get-Download $BepUrl $BepSha $Zip
+    New-Item -ItemType Directory -Path $BepDir -Force | Out-Null
+    Write-Host '    extracting'
+    Expand-Archive -LiteralPath $Zip -DestinationPath $BepDir -Force
+    if (-not (Test-Path -LiteralPath (Join-Path $BepDir 'BepInEx\core\BepInEx.Preloader.dll'))) { throw "BepInEx.Preloader.dll not found after extracting $Zip." }
+}
+
+# ---------------------------------------------------------------- 5. managed build
+if (-not $SkipManaged) {
+    Step "dotnet build UltraRing.sln -c $Configuration"
+    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) { throw 'The .NET SDK (dotnet) was not found in PATH.' }
+    & dotnet build (Join-Path $Root 'UltraRing.sln') -c $Configuration --nologo -v:minimal
+    if ($LASTEXITCODE -ne 0) { throw 'dotnet build failed.' }
+}
+
+# ---------------------------------------------------------------- 6. stage the ULTRAKILL BepInEx runtime
+Step 'Staging runtime\ultrakill-bepinex'
+$Stage = Join-Path $Root 'runtime\ultrakill-bepinex'
+$Out = Join-Path $Root "src\UltraRing.Ultrakill\bin\$Configuration\netstandard2.1"
+foreach ($Name in 'UltraRing.Ultrakill.dll', 'UltraRing.Link.dll') {
+    if (-not (Test-Path -LiteralPath (Join-Path $Out $Name))) { throw "Missing $Out\$Name (build the solution first)." }
+}
+$StageCore = Join-Path $Stage 'BepInEx\core'
+$StagePlugin = Join-Path $Stage 'BepInEx\plugins\UltraRing'
+New-Item -ItemType Directory -Path $StageCore, $StagePlugin, (Join-Path $Stage 'BepInEx\config') -Force | Out-Null
+Copy-Item -Path (Join-Path $BepDir 'BepInEx\core\*') -Destination $StageCore -Recurse -Force
+Copy-Item -LiteralPath (Join-Path $BepDir 'winhttp.dll') -Destination (Join-Path $Stage 'winhttp.dll') -Force
+foreach ($Name in 'UltraRing.Ultrakill.dll', 'UltraRing.Link.dll') {
+    Copy-Item -LiteralPath (Join-Path $Out $Name) -Destination (Join-Path $StagePlugin $Name) -Force
+}
+$Pdb = Join-Path $Out 'UltraRing.Ultrakill.pdb'
+if (Test-Path -LiteralPath $Pdb) { Copy-Item -LiteralPath $Pdb -Destination $StagePlugin -Force }
+
+Write-Host ''
+Write-Host 'Build finished.' -ForegroundColor Green
+Write-Host "  host DLLs : $McDir\dist"
+Write-Host "  BepInEx   : $Stage"
+Write-Host "  plugin    : $StagePlugin"
+Write-Host 'Next: .\Install.ps1, then .\Launch.ps1 (or .\Launch.ps1 -FakeHost to test without Elden Ring).'

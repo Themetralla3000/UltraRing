@@ -21,6 +21,11 @@ namespace UltraRing.Ultrakill
         public static ConfigEntry<bool> Composite;
         public static ConfigEntry<bool> InputOverlay;
         public static ConfigEntry<KeyCode> SwitchKey;
+        public static ConfigEntry<string> WindowMode;
+        public static ConfigEntry<float> CaptureScale;
+        public static ConfigEntry<bool> CaptureFlipRows;
+        public static ConfigEntry<string> WorldAlpha, HandAlpha, GuiAlpha;
+        public static ConfigEntry<bool> HideMainRender;
 
         // Terrain
         public static ConfigEntry<float> TerrainRadius;
@@ -52,6 +57,19 @@ namespace UltraRing.Ultrakill
             InputOverlay = cfg.Bind("Rendering", "InputOverlay", true,
                 "Glue ULTRAKILL's window, nearly transparent, on top of the host window so it receives keyboard and mouse.");
             SwitchKey = cfg.Bind("Rendering", "SwitchKey", KeyCode.F8, "Hand control to the host game and back.");
+            WindowMode = cfg.Bind("Rendering", "WindowMode", "Layered",
+                "How the input window hides itself above the host: Layered (constant opacity 1/255), Region (full-size window clipped to one pixel; use if Layered shows ULTRAKILL opaque) or Tiny (a 1x1 window). Env ULTRARING_WINDOW_MODE overrides.");
+
+            CaptureScale = cfg.Bind("Rendering", "CaptureScale", 1f,
+                "Capture resolution as a fraction of the host window (lower = faster, blurrier V1 layer).");
+            CaptureFlipRows = cfg.Bind("Rendering", "CaptureFlipRows", false,
+                "Flip captured frames vertically. Turn on if V1's arm and HUD appear upside down in the host.");
+            WorldAlpha = cfg.Bind("Rendering", "WorldAlpha", "MaxRgb",
+                "Alpha repair for the effects layer: None, Opaque or MaxRgb (alpha from the brightest channel).");
+            HandAlpha = cfg.Bind("Rendering", "HandAlpha", "Opaque", "Alpha repair for the viewmodel layer: None, Opaque or MaxRgb.");
+            GuiAlpha = cfg.Bind("Rendering", "GuiAlpha", "MaxRgb", "Alpha repair for the HUD layer: None, Opaque or MaxRgb.");
+            HideMainRender = cfg.Bind("Rendering", "HideMainRender", false,
+                "Stop ULTRAKILL's own camera from drawing the (hidden) world, to save GPU time. Experimental.");
 
             TerrainRadius = cfg.Bind("Terrain", "Radius", 24f, "Host terrain is sampled this far (metres) around V1.");
             TerrainCell = cfg.Bind("Terrain", "CellSize", 0.5f, "Horizontal sampling resolution in metres.");

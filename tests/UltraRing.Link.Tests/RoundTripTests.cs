@@ -30,6 +30,7 @@ public static unsafe class RoundTripTests
             InitZeroing(dir);
             RoundTrip(dir);
             Frames(dir);
+            GuestFramesWriter(dir);
         }
         catch (Exception e)
         {
@@ -328,5 +329,120 @@ public static unsafe class RoundTripTests
         Expect(frames.LatestFrameId == 0, "latestFrameId read");
         *(ulong*)(b + 0x10) = 777;
         Expect(frames.LatestFrameId == 777, "latestFrameId read after guest write");
+    }
+
+    private static void GuestFramesWriter(string dir)
+    {
+        string path = Path.Combine(dir, "gf", "frames.shm");
+        Directory.CreateDirectory(Path.GetDirectoryName(path));
+
+        // A stale file from an earlier guest: wrong magic, big latestFrameId, host-owned bytes 0x40..0xDF with a pattern.
+        using (var stale = MappedFile.Open(path, Protocol.FramesFileSize))
+        {
+            *(uint*)stale.Base = 0xDEADBEEF;
+            *(ulong*)(stale.Base + 0x10) = ulong.MaxValue / 2;
+            for (int i = 0x40; i < 0xE0; i++) stale.Base[i] = (byte)(i ^ 0x5A);
+            *(uint*)(stale.Base + 0x1000 + 4) = 77;   // slot 0 width
+        }
+        using var host = new HostFrames();
+        Expect(!host.TryOpen(path, true), "guest frames: stale magic rejected before the guest initialises");
+        using var gf = GuestFrames.Open(path);
+        Expect(new FileInfo(path).Length >= Protocol.FramesFileSize, "guest frames: file has the full size");
+        Expect(host.TryOpen(path, true), "guest frames: host opens after GuestFrames.Open");
+        using (var peek = MappedFile.Open(path, Protocol.FramesFileSize))
+        {
+            byte* hb = peek.Base;
+            Expect(*(uint*)hb == Protocol.FramesMagic && *(uint*)(hb + 4) == Protocol.FramesVersion, "guest frames: magic + version 3");
+            bool hostBytesKept = true;
+            for (int i = 0x40; i < 0xE0; i++) if (hb[i] != (byte)(i ^ 0x5A)) hostBytesKept = false;
+            Expect(hostBytesKept, "guest frames: never touches host-owned 0x40..0xDF");
+            Expect(*(uint*)(hb + 0x1000 + 4) == 0, "guest frames: slot headers zeroed");
+        }
+        Expect(gf.LastFrameId >= ulong.MaxValue / 2, "guest frames: counter seeded above stale latestFrameId");
+        Expect(host.PickSlot(1) == -1, "guest frames: nothing published => no slot");
+
+        const int w = 5, h = 3, layer = w * h * 4;
+        var src = new byte[layer];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int o = (y * w + x) * 4;
+                src[o] = (byte)(10 * y + x); src[o + 1] = (byte)(100 + y); src[o + 2] = (byte)(200 + x); src[o + 3] = 255;
+            }
+        var wrk = new byte[layer]; var depth = new byte[layer]; var gui = new byte[layer]; var hand = new byte[layer];
+
+        ulong lastId = gf.LastFrameId;
+        var ids = new ulong[4];
+        var slots = new int[4];
+        fixed (byte* sp = src)
+        {
+            for (int n = 0; n < 4; n++)
+            {
+                int slot = gf.BeginSlot(w, h);
+                slots[n] = slot;
+                Expect(slot >= 0 && gf.WriteLayer(slot, GuestFrames.LayerWorld, sp, layer, false, AlphaFix.None), "guest frames: write world " + n);
+                if (n == 1) Expect(host.PickSlot(1000) != slot, "guest frames: slot being written (odd seq) is skipped");
+                gf.WriteLayer(slot, GuestFrames.LayerGui, sp, layer, true, AlphaFix.None);
+                if (n != 2) gf.WriteLayer(slot, GuestFrames.LayerHand, sp, layer, false, AlphaFix.None);
+                gf.FillDepth(slot, 1f);
+                uint flags = Protocol.FrameWorld | Protocol.FrameGui | (n != 2 ? Protocol.FrameHand : 0);
+                ids[n] = gf.Publish(slot, (ulong)(10 + n), flags, 0.05f, 2000f, 90f, 16f / 9f);
+                Expect(ids[n] > lastId, "guest frames: frame ids strictly increase " + n);
+                lastId = ids[n];
+            }
+        }
+        Expect(slots[0] != slots[1] && slots[1] != slots[2] && slots[2] != slots[0] && slots[3] == slots[0], "guest frames: slots rotate round robin");
+        Expect(host.LatestFrameId == ids[3] && ids[3] == gf.LatestFrameId, "guest frames: latestFrameId released");
+        using (var peek = MappedFile.Open(path, Protocol.FramesFileSize))
+            Expect(*(uint*)(peek.Base + 8) == (uint)slots[3], "guest frames: latestSlot written");
+
+        // Poses 11, 12, 13 survive (pose 10 was overwritten by pose 13).
+        Expect(host.PickSlot(13) == slots[3] && host.PickSlot(12) == slots[2] && host.PickSlot(11) == slots[1], "guest frames: host pick_slot exact");
+        Expect(host.PickSlot(10) == -1, "guest frames: overwritten pose is gone");
+        Expect(host.PickSlot(99) == slots[3], "guest frames: newest older pose");
+        Expect(host.ReadSlotHeader(slots[3], out var hdr) && hdr.width == w && hdr.height == h && hdr.poseId == 13 && hdr.frameId == ids[3]
+               && hdr.mcNear == 0.05f && hdr.mcFar == 2000f && hdr.fovYDeg == 90f && Math.Abs(hdr.aspect - 16f / 9f) < 1e-6
+               && hdr.flags == (Protocol.FrameWorld | Protocol.FrameGui | Protocol.FrameHand) && hdr.gpuIndex == 0 && hdr.gpuGeneration == 0
+               && hdr.seq != 0 && (hdr.seq & 1) == 0, "guest frames: slot header fields");
+        Expect(host.CopySlot(slots[3], out hdr, wrk, depth, gui, hand), "guest frames: host copies the slot");
+        Expect(wrk.AsSpan().SequenceEqual(src), "guest frames: world layer bytes round trip (no flip)");
+        Expect(hand.AsSpan().SequenceEqual(src), "guest frames: hand layer bytes");
+        bool flipped = true;
+        for (int y = 0; y < h; y++)
+            for (int i = 0; i < w * 4; i++)
+                if (gui[y * w * 4 + i] != src[(h - 1 - y) * w * 4 + i]) flipped = false;
+        Expect(flipped, "guest frames: vertical flip reverses rows");
+        bool depthOne = true;
+        for (int i = 0; i < w * h; i++) if (BitConverter.ToSingle(depth, i * 4) != 1.0f) depthOne = false;
+        Expect(depthOne, "guest frames: depth layer is 1.0f");
+        Expect(host.ReadSlotHeader(slots[2], out hdr) && (hdr.flags & Protocol.FrameHand) == 0, "guest frames: hand flag omitted when not written");
+
+        // Alpha repair modes (pixels are B,G,R,A).
+        var px = new byte[] { 0, 0, 0, 0,   9, 0, 0, 0,   0, 20, 0, 0,   30, 10, 40, 5,   1, 2, 3, 200 };
+        const int pw = 5;
+        fixed (byte* pp = px)
+        {
+            int slot = gf.BeginSlot(pw, 1);
+            gf.WriteLayer(slot, GuestFrames.LayerWorld, pp, px.Length, false, AlphaFix.Opaque);
+            gf.WriteLayer(slot, GuestFrames.LayerGui, pp, px.Length, false, AlphaFix.MaxRgb);
+            gf.Publish(slot, 50, Protocol.FrameWorld | Protocol.FrameGui, 0.1f, 100f, 90f, 1f);
+            var w2 = new byte[pw * 4]; var g2 = new byte[pw * 4];
+            Expect(host.CopySlot(slot, out _, w2, default, g2, default), "guest frames: alpha test slot copies");
+            Expect(w2[3] == 0 && w2[7] == 255 && w2[11] == 255 && w2[15] == 255 && w2[19] == 255 && w2[4] == 9 && w2[9] == 20, "guest frames: AlphaFix.Opaque");
+            Expect(g2[3] == 0 && g2[7] == 9 && g2[11] == 20 && g2[15] == 40 && g2[19] == 200 && g2[12] == 30, "guest frames: AlphaFix.MaxRgb");
+        }
+
+        // Abort leaves an invalid slot, bad sizes and short sources are refused.
+        int a = gf.BeginSlot(w, h);
+        gf.Abort(a);
+        using (var peek = MappedFile.Open(path, Protocol.FramesFileSize))
+        {
+            var ah = (ErmcFrameHeader*)(peek.Base + 0x1000 + (long)a * Protocol.FrameSlotSize);
+            Expect(ah->width == 0 && (ah->seq & 1) == 0, "guest frames: aborted slot is invalid");
+        }
+        Expect(gf.BeginSlot(0, 10) == -1 && gf.BeginSlot(Protocol.FrameMaxW + 1, 10) == -1 && gf.BeginSlot(10, Protocol.FrameMaxH + 1) == -1, "guest frames: bad sizes refused");
+        int b = gf.BeginSlot(w, h);
+        fixed (byte* sp = src) Expect(!gf.WriteLayer(b, GuestFrames.LayerWorld, sp, layer - 1, false, AlphaFix.None), "guest frames: short source refused");
+        gf.Abort(b);
     }
 }
