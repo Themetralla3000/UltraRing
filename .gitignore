@@ -1,0 +1,14 @@
+# Toolchains, third-party sources, runtime state
+.tools/
+external/
+runtime/
+
+# Build outputs
+bin/
+obj/
+dist/
+build/
+
+# IDE
+.vs/
+*.user
