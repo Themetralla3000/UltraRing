@@ -41,5 +41,6 @@ unsafe
     Check("hunterYawDeg offset", (int)((byte*)&c.hunterYawDeg - (byte*)&c), 0x58);
 }
 failures += RoundTripTests.Run();
+failures += CacheTests.Run();
 Console.WriteLine(failures == 0 ? "ALL OK" : $"{failures} FAILURES");
 return failures == 0 ? 0 : 1;

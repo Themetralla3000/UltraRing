@@ -37,8 +37,18 @@ namespace UltraRing.Ultrakill.Terrain
         private const float PriorityRadius = 2f;    // the cells this close to V1 are always sampled first
         private const float SeedRefTol = 3f;        // a neighbour sampled from a ground reference further off is not trusted
         private const float WallRadius = 12f;       // horizontal wall rays are cast this close to V1 / its path
-        private const float LookAheadSeconds = 1f;
-        private const float LookAheadMax = 20f;
+        private const float LookAheadSeconds = 1.5f;   // ULTRAKILL: walk 8 m/s, slide 12, dash 25 (at 0.5 m/unit)
+        private const float LookAheadMax = 35f;
+        private const float CorridorMinSpeed = 3f;      // m/s: slower than this there is no corridor, only the ring
+        private const float CorridorCos = 0.866f;       // cone half-angle 30 degrees around the velocity
+        private const int CorridorMaxRays = 2600;       // the corridor never takes more than this of a batch
+        private const int RevalidateMaxRays = 512;      // cached cells re-checked per batch (lowest priority)
+        private const float CacheRevalidateAge = 600f;  // seconds: cached cells older than this are re-sampled lazily
+        private const float SaveInterval = 10f;
+        private const float CacheLoadRadius = 130f;     // regions this close to V1 are kept in memory ...
+        private const float CacheUnloadRadius = 190f;   // ... and dropped (once saved) beyond this
+        private const float CacheLiveMargin = 8f;       // cached chunks within radius + this become colliders
+        private const int CacheChunksPerScan = 8;
         private const float WallRefreshAge = 10f;
         private const float WallBaseTol = 0.1f;     // re-cast an edge when its base floor moved this much
         private const float WallHitEps = 0.02f;
@@ -101,6 +111,9 @@ namespace UltraRing.Ultrakill.Terrain
         private float _radius = 24f;
         private int[] _offX = new int[0], _offZ = new int[0];
         private int _priorityCount;
+        private int[] _corrX = new int[0], _corrZ = new int[0]; // the same, out to LookAheadMax, for the velocity corridor
+        private double _vx, _vz;                                // V1's horizontal velocity, host m/s
+        private bool _revalidate;                               // BuildBatch last pass: only stale cached cells
 
         // V1 / look-ahead in host metres, refreshed every tick.
         private double _fx, _fz, _lax, _laz;
@@ -127,6 +140,14 @@ namespace UltraRing.Ultrakill.Terrain
         private float _nextScan;
         private float _nextEvict;
 
+        // Persistent cache.
+        private TerrainCache _tc;
+        private readonly HashSet<long> _fromCache = new HashSet<long>(); // live chunks already filled from the cache
+        private readonly List<KeyValuePair<double, long>> _cand = new List<KeyValuePair<double, long>>();
+        private int _cachedLeft;          // loaded cells not yet re-sampled
+        private long _cellsFromCache;     // total cells filled from the cache this zone session
+        private float _nextSave, _nextCacheScan, _nextCacheUpdate;
+
         // Stats.
         private int _batchesInWindow;
         private float _windowStart;
@@ -141,13 +162,29 @@ namespace UltraRing.Ultrakill.Terrain
         private static Material[] _dbgMats;
         private static bool _dbgMatsFailed;
 
-        public TerrainManager(Transform parent) => _parent = parent;
+        public TerrainManager(Transform parent)
+        {
+            _parent = parent;
+            TerrainCache.Log = m => Plugin.Log.LogWarning(m);
+            Application.quitting += OnQuit;
+        }
+
+        private void OnQuit()
+        {
+            try { FlushAndWait(3000); }
+            catch (Exception e) { Plugin.Log.LogWarning("Terrain cache flush on quit failed: " + e.Message); }
+        }
 
         public string Status => _status;
 
         /// <summary>Forget every sample and destroy every collider (zone change, scene change, host restart).</summary>
         public void Reset()
         {
+            Flush();
+            _tc = null;
+            _fromCache.Clear();
+            _cachedLeft = 0;
+            _cellsFromCache = 0;
             foreach (var kv in _chunks) kv.Value.DestroyObjects();
             _chunks.Clear();
             // The in-flight batch (if any) is abandoned; its sequence stays busy in the mailbox, so the next
@@ -193,10 +230,12 @@ namespace UltraRing.Ultrakill.Terrain
                 double ll = Math.Sqrt(lx * lx + lz * lz);
                 if (ll > LookAheadMax) { lx *= LookAheadMax / ll; lz *= LookAheadMax / ll; }
                 _lax = lx; _laz = lz;
+                _vx = velocityUk.x * mpu; _vz = velocityUk.z * mpu;
                 var vc = GetChunk(vcx >> 4, vcz >> 4);
                 _vCeil = vc == null ? float.NaN : vc.Ceil[((vcz & 15) << 4) | (vcx & 15)];
             }
             if (DebugDraw != _debugApplied) ApplyDebugState();
+            CacheTick(map, now);
 
             // 1. Collect the batch in flight.
             if (_inflight)
@@ -310,6 +349,7 @@ namespace UltraRing.Ultrakill.Terrain
                         int idx = lz * TerrainChunk.Size + lx;
                         if (c.State[idx] == TerrainChunk.Done) c.DoneCount--;
                         c.State[idx] = TerrainChunk.NeedLow;
+                        if (c.Cached[idx]) { c.Cached[idx] = false; c.CachedLeft--; _cachedLeft--; }
                         unchecked { c.Ver[idx]++; }
                         ResetEdges(c, idx);
                         // The edges of the cells to the -x / -z probe into this one.
@@ -371,7 +411,17 @@ namespace UltraRing.Ultrakill.Terrain
         /// <summary>All cell offsets inside the sampling disc, nearest first.</summary>
         private void BuildOffsets()
         {
-            float rc = _radius / _cell;
+            var keys = SortedDisc(_radius / _cell, out _offX, out _offZ);
+            float pr = PriorityRadius / _cell;
+            int pr2 = (int)Math.Floor(pr * pr);
+            _priorityCount = 0;
+            while (_priorityCount < keys.Length && keys[_priorityCount] <= pr2) _priorityCount++;
+            SortedDisc(Math.Max(_radius, LookAheadMax) / _cell, out _corrX, out _corrZ);
+        }
+
+        /// <summary>The cell offsets within <paramref name="rc"/> cells of the origin, nearest first; returns their squared distances.</summary>
+        private static int[] SortedDisc(float rc, out int[] offX, out int[] offZ)
+        {
             int r = (int)Math.Ceiling(rc);
             float rc2 = rc * rc;
             int n = 0;
@@ -390,17 +440,14 @@ namespace UltraRing.Ultrakill.Terrain
                         k++;
                     }
             Array.Sort(keys, packed);
-            float pr = PriorityRadius / _cell;
-            int pr2 = (int)Math.Floor(pr * pr);
-            _priorityCount = 0;
-            while (_priorityCount < n && keys[_priorityCount] <= pr2) _priorityCount++;
-            _offX = new int[n];
-            _offZ = new int[n];
+            offX = new int[n];
+            offZ = new int[n];
             for (int i = 0; i < n; i++)
             {
-                _offX[i] = (packed[i] & 0xFFFF) - r;
-                _offZ[i] = (packed[i] >> 16) - r;
+                offX[i] = (packed[i] & 0xFFFF) - r;
+                offZ[i] = (packed[i] >> 16) - r;
             }
+            return keys;
         }
 
         /// <summary>
@@ -461,13 +508,45 @@ namespace UltraRing.Ultrakill.Terrain
             unchecked { _tag++; }
             if (_tag == 0) _tag = 1;
 
+            _revalidate = false;
+
             // 1. The ground under and around V1 always comes first.
             for (int k = 0; k < _priorityCount && count < MaxBatchRays; k++)
                 ProcessCell(vcx + _offX[k], vcz + _offZ[k], true, now, ref count);
 
-            // 2. Everything else, nearest to V1's predicted position first.
+            // 2. The corridor along V1's velocity (cone, out to the look-ahead), nearest first.
+            double speed = Math.Sqrt(_vx * _vx + _vz * _vz);
+            if (speed > CorridorMinSpeed)
+            {
+                double ux = _vx / speed, uz = _vz / speed;
+                double reach = Math.Min(speed * LookAheadSeconds, LookAheadMax) / _cell;
+                double reach2 = reach * reach;
+                int start = count;
+                int cap = Math.Min(MaxBatchRays, start + CorridorMaxRays);
+                for (int k = _priorityCount; k < _corrX.Length && count < cap; k++)
+                {
+                    int dx = _corrX[k], dz = _corrZ[k];
+                    double d2 = dx * dx + dz * dz;
+                    if (d2 > reach2) break;
+                    double dot = dx * ux + dz * uz;
+                    if (dot <= 0 || dot * dot < CorridorCos * CorridorCos * d2) continue;
+                    ProcessCell(vcx + dx, vcz + dz, false, now, ref count);
+                }
+            }
+
+            // 3. Everything else, nearest to V1's predicted position first.
             for (int k = 0; k < _offX.Length && count < MaxBatchRays; k++)
                 ProcessCell(pcx + _offX[k], pcz + _offZ[k], false, now, ref count);
+
+            // 4. Last and cheapest: cached cells that have not been looked at for a long while.
+            if (_cachedLeft > 0 && count < MaxBatchRays)
+            {
+                _revalidate = true;
+                int cap = Math.Min(MaxBatchRays, count + RevalidateMaxRays);
+                for (int k = 0; k < _offX.Length && count < cap; k++)
+                    ProcessCell(vcx + _offX[k], vcz + _offZ[k], false, now, ref count);
+                _revalidate = false;
+            }
             return count;
         }
 
@@ -488,15 +567,23 @@ namespace UltraRing.Ultrakill.Terrain
             var c = GetCached(ix >> 4, iz >> 4);
             int idx = ((iz & 15) << 4) | (ix & 15);
             int kind;
-            if (c == null) kind = TerrainChunk.NeedLow;
+            if (c == null)
+            {
+                if (_revalidate) return;
+                kind = TerrainChunk.NeedLow;
+            }
             else
             {
                 if (c.Queued[idx] == _tag) return;
                 byte st = c.State[idx];
                 if (st == TerrainChunk.Done)
                 {
-                    if (priority) return;
-                    if (NeedsRefresh(c, idx, ix - _vcx, iz - _vcz, now))
+                    bool stale;
+                    if (_revalidate) stale = c.Cached[idx] && now - c.Stamp[idx] > CacheRevalidateAge;
+                    // Cells within 2 m that came from the cache are checked at once; the others only get their walls looked at.
+                    else if (priority && !c.Cached[idx]) { WallWork(c, idx, ix, iz, now, ref count); return; }
+                    else stale = NeedsRefresh(c, idx, ix - _vcx, iz - _vcz, now);
+                    if (stale)
                     {
                         c.State[idx] = TerrainChunk.NeedLow;
                         c.DoneCount--;
@@ -504,10 +591,11 @@ namespace UltraRing.Ultrakill.Terrain
                     }
                     else
                     {
-                        WallWork(c, idx, ix, iz, now, ref count);
+                        if (!_revalidate) WallWork(c, idx, ix, iz, now, ref count);
                         return;
                     }
                 }
+                else if (_revalidate) return;
                 else kind = st;
             }
 
@@ -658,6 +746,7 @@ namespace UltraRing.Ultrakill.Terrain
                 if (mask == 0)
                 {
                     for (int s = 0; s < 6; s++) SetHit(c, hb + s, float.NaN);
+                    if (!c.EInCache[ei] || c.EMask[ei] != 0) { c.ENeedSave[ei] = true; c.CacheDirty = true; }
                     c.EMask[ei] = 0; c.EBase[ei] = float.NaN; c.EState[ei] = TerrainChunk.WDone; c.EStamp[ei] = now;
                     c.WallsDirty = true;
                     continue;
@@ -706,12 +795,16 @@ namespace UltraRing.Ultrakill.Terrain
                     }
                 }
                 _batchWallRays += pend;
+                bool planChanged = !c.EInCache[ei] || c.EMask[ei] != mask
+                    || float.IsNaN(c.EBase[ei]) != float.IsNaN(baseY)
+                    || (!float.IsNaN(baseY) && Math.Abs(c.EBase[ei] - baseY) > WallBaseTol * 0.25f);
                 c.EMask[ei] = (byte)mask;
                 c.EBase[ei] = baseY;
                 c.EPend[ei] = (byte)pend;
                 c.EStamp[ei] = now;
                 c.EState[ei] = pend == 0 ? TerrainChunk.WDone : TerrainChunk.WPending;
                 if (pend == 0) c.WallsDirty = true;
+                if (planChanged) { c.ENeedSave[ei] = true; c.CacheDirty = true; }
             }
         }
 
@@ -724,6 +817,8 @@ namespace UltraRing.Ultrakill.Terrain
             {
                 c.EHit[hi] = v;
                 c.WallsDirty = true; // wall boxes are chunk-local: edges belong to the chunk of their first cell
+                c.ENeedSave[hi / 6] = true;
+                c.CacheDirty = true;
             }
         }
 
@@ -762,6 +857,7 @@ namespace UltraRing.Ultrakill.Terrain
                     {
                         c.EState[ei] = TerrainChunk.WDone;
                         c.EStamp[ei] = now;
+                        if (!c.EInCache[ei]) { c.ENeedSave[ei] = true; c.CacheDirty = true; }
                     }
                     continue;
                 }
@@ -820,11 +916,14 @@ namespace UltraRing.Ultrakill.Terrain
             else Finish(c, idx, now);
         }
 
-        private static void Finish(TerrainChunk c, int idx, float now)
+        private void Finish(TerrainChunk c, int idx, float now)
         {
             if (c.State[idx] != TerrainChunk.Done) c.DoneCount++;
             c.State[idx] = TerrainChunk.Done;
             c.Stamp[idx] = now;
+            bool verified = c.Cached[idx];
+            if (verified) { c.Cached[idx] = false; c.CachedLeft--; _cachedLeft--; }
+            if (verified || !c.InCache[idx]) { c.NeedSave[idx] = true; c.CacheDirty = true; } // new cell, or a fresh timestamp
         }
 
         /// <summary>Stores a floor height. Returns true when the floor appeared, vanished or moved by more than <see cref="BigChange"/>.</summary>
@@ -836,6 +935,8 @@ namespace UltraRing.Ultrakill.Terrain
             if (oldNaN != newNaN || Math.Abs(old - v) > ChangeEps)
             {
                 c.Floor[idx] = v;
+                c.NeedSave[idx] = true;
+                c.CacheDirty = true;
                 MarkDirty(c, idx);
                 return oldNaN != newNaN || Math.Abs(old - v) > BigChange;
             }
@@ -850,6 +951,8 @@ namespace UltraRing.Ultrakill.Terrain
             if (oldNaN != newNaN || Math.Abs(old - v) > ChangeEps)
             {
                 c.Ceil[idx] = v;
+                c.NeedSave[idx] = true;
+                c.CacheDirty = true;
                 c.Dirty = true; // ceilings are chunk-local: the neighbours' quads do not depend on them
             }
         }
@@ -877,7 +980,7 @@ namespace UltraRing.Ultrakill.Terrain
         private void Evict(double fx, double fz)
         {
             double len = TerrainChunk.Size * (double)_cell;
-            double lim = _radius + EvictMargin;
+            double lim = Math.Max(_radius + EvictMargin, LookAheadMax + 8f); // the velocity corridor reaches further than the ring
             double lim2 = lim * lim;
             _scratchChunks.Clear();
             foreach (var kv in _chunks)
@@ -891,6 +994,9 @@ namespace UltraRing.Ultrakill.Terrain
             for (int i = 0; i < _scratchChunks.Count; i++)
             {
                 var c = _scratchChunks[i];
+                if (c.CacheDirty) SnapshotChunk(c, Time.unscaledTime);
+                _cachedLeft -= c.CachedLeft;
+                _fromCache.Remove(c.Key());
                 _chunks.Remove(c.Key());
                 c.DestroyObjects();
             }
@@ -1243,6 +1349,202 @@ namespace UltraRing.Ultrakill.Terrain
         }
 
         // ---------------------------------------------------------------------------------------
+        // persistent cache (see TerrainCache): every Done cell and wall edge is mirrored into per-zone region files
+        // ---------------------------------------------------------------------------------------
+
+        private static uint NowUnix() => (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        private void CacheTick(CoordMap map, float now)
+        {
+            if (!BridgeConfig.TerrainCache.Value)
+            {
+                if (_tc != null) { Flush(); _tc = null; }
+                return;
+            }
+            if (_tc == null || _tc.Zone != map.Zone || _tc.Cell != _cell)
+            {
+                if (_tc != null) Flush();
+                string dir = System.IO.Path.Combine(BridgePaths.Dir, "terrain-cache", map.Zone.ToString("X8"));
+                _tc = new TerrainCache(dir, map.Zone, _cell);
+                _fromCache.Clear();
+                _nextSave = now + SaveInterval;
+                _nextCacheUpdate = 0f;
+                _nextCacheScan = 0f;
+                Plugin.Log.LogInfo($"Terrain cache: zone {map.Zone:X8}, {_tc.ZoneFiles} region file(s) in {dir}");
+            }
+            if (now >= _nextCacheUpdate)
+            {
+                _nextCacheUpdate = now + 0.25f;
+                _tc.Update(_fx, _fz, CacheLoadRadius, CacheUnloadRadius);
+            }
+            if (now >= _nextCacheScan)
+            {
+                _nextCacheScan = now + 0.1f;
+                LoadNearbyFromCache(now);
+            }
+            if (now >= _nextSave)
+            {
+                _nextSave = now + SaveInterval;
+                Flush();
+            }
+        }
+
+        /// <summary>Snapshots every chunk with unsaved samples and queues the dirty region files for the IO worker.</summary>
+        public void Flush()
+        {
+            var tc = _tc;
+            if (tc == null) return;
+            float now = Time.unscaledTime;
+            foreach (var kv in _chunks)
+                if (kv.Value.CacheDirty) SnapshotChunk(kv.Value, now);
+            tc.Save();
+        }
+
+        private void FlushAndWait(int ms)
+        {
+            Flush();
+            TerrainCacheWorker.WaitIdle(ms);
+        }
+
+        /// <summary>Copies the chunk's finished cells and wall edges into the cache (as a new immutable record).</summary>
+        private void SnapshotChunk(TerrainChunk c, float now)
+        {
+            var tc = _tc;
+            if (tc == null) return;
+            var d = new CacheChunk(c.Cx, c.Cz);
+            uint nowU = NowUnix();
+            bool any = false, remain = false;
+            for (int i = 0; i < TerrainChunk.Cells; i++)
+            {
+                if (c.State[i] != TerrainChunk.Done) { if (c.NeedSave[i]) remain = true; continue; }
+                d.Flags[i] = 1;
+                d.Floor[i] = c.Floor[i];
+                d.Ceil[i] = c.Ceil[i];
+                d.Ref[i] = c.Ref[i];
+                d.Time[i] = AgeToUnix(nowU, now - c.Stamp[i]);
+                c.InCache[i] = true;
+                c.NeedSave[i] = false;
+                any = true;
+            }
+            for (int e = 0; e < 2 * TerrainChunk.Cells; e++)
+            {
+                if (c.EState[e] != TerrainChunk.WDone) { if (c.ENeedSave[e]) remain = true; continue; }
+                d.EFlags[e] = 1;
+                d.EMask[e] = c.EMask[e];
+                d.EBase[e] = c.EBase[e];
+                d.ETime[e] = AgeToUnix(nowU, now - c.EStamp[e]);
+                for (int s = 0; s < 6; s++) d.EHit[e * 6 + s] = TerrainCache.PackHit(c.EHit[e * 6 + s]);
+                c.EInCache[e] = true;
+                c.ENeedSave[e] = false;
+                any = true;
+            }
+            if (any) tc.Apply(d);
+            c.CacheDirty = remain;
+        }
+
+        private static uint AgeToUnix(uint nowU, float ageSeconds)
+        {
+            uint age = ageSeconds <= 0f || float.IsNaN(ageSeconds) ? 0u : (uint)Math.Min(ageSeconds, 4e9f);
+            return nowU > age ? nowU - age : 0u;
+        }
+
+        /// <summary>Turns cached chunks near V1 (and its path) into live ones, nearest first, a few per scan.</summary>
+        private void LoadNearbyFromCache(float now)
+        {
+            var tc = _tc;
+            if (tc == null) return;
+            double len = TerrainChunk.Size * (double)_cell;
+            double live = Math.Max(_radius + CacheLiveMargin, LookAheadMax);
+            int cx0 = (int)Math.Floor((_fx - live) / len), cx1 = (int)Math.Floor((_fx + live) / len);
+            int cz0 = (int)Math.Floor((_fz - live) / len), cz1 = (int)Math.Floor((_fz + live) / len);
+            double ox = _fx + _lax * 0.5, oz = _fz + _laz * 0.5;
+            _cand.Clear();
+            for (int cz = cz0; cz <= cz1; cz++)
+                for (int cx = cx0; cx <= cx1; cx++)
+                {
+                    long key = TerrainChunk.Key(cx, cz);
+                    if (_fromCache.Contains(key)) continue;
+                    double bx = cx * len, bz = cz * len;
+                    double dx = Math.Max(bx, Math.Min(_fx, bx + len)) - _fx;
+                    double dz = Math.Max(bz, Math.Min(_fz, bz + len)) - _fz;
+                    if (dx * dx + dz * dz > live * live) continue;
+                    if (tc.Get(cx, cz) == null) continue;
+                    double mx = bx + len * 0.5 - ox, mz = bz + len * 0.5 - oz;
+                    _cand.Add(new KeyValuePair<double, long>(mx * mx + mz * mz, key));
+                }
+            if (_cand.Count == 0) return;
+            if (_cand.Count > 1) _cand.Sort((a, b) => a.Key.CompareTo(b.Key));
+            int n = Math.Min(_cand.Count, CacheChunksPerScan);
+            for (int i = 0; i < n; i++)
+            {
+                long key = _cand[i].Value;
+                int cx = (int)(key >> 32), cz = (int)(uint)key;
+                var cc = tc.Get(cx, cz);
+                if (cc != null) LoadChunkFromCache(cc, now);
+                _fromCache.Add(key);
+            }
+        }
+
+        private void LoadChunkFromCache(CacheChunk cc, float now)
+        {
+            bool created = false;
+            if (!_chunks.TryGetValue(TerrainChunk.Key(cc.Cx, cc.Cz), out var c))
+            {
+                c = CreateChunk(cc.Cx, cc.Cz);
+                created = true;
+            }
+            uint nowU = NowUnix();
+            int cells = 0, edges = 0;
+            for (int i = 0; i < TerrainChunk.Cells; i++)
+            {
+                if ((cc.Flags[i] & 1) == 0) continue;
+                // An existing (live) chunk keeps what it has sampled itself: only untouched cells are filled.
+                if (!created && (c.State[i] != TerrainChunk.NeedLow || c.Ver[i] != 0 || !float.IsNaN(c.Floor[i])
+                                 || (_inflight && c.Queued[i] == _tag))) continue;
+                c.Floor[i] = cc.Floor[i];
+                c.Ceil[i] = cc.Ceil[i];
+                c.Ref[i] = cc.Ref[i];
+                c.Stamp[i] = now - (nowU > cc.Time[i] ? (float)(nowU - cc.Time[i]) : 0f);
+                if (c.State[i] != TerrainChunk.Done) { c.State[i] = TerrainChunk.Done; c.DoneCount++; }
+                if (!c.Cached[i]) { c.Cached[i] = true; c.CachedLeft++; _cachedLeft++; }
+                c.InCache[i] = true;
+                cells++;
+            }
+            for (int e = 0; e < 2 * TerrainChunk.Cells; e++)
+            {
+                if ((cc.EFlags[e] & 1) == 0) continue;
+                if (!created && c.EState[e] != TerrainChunk.WNeed) continue;
+                c.EState[e] = TerrainChunk.WDone;
+                c.EMask[e] = cc.EMask[e];
+                c.EBase[e] = cc.EBase[e];
+                c.EStamp[e] = now - (nowU > cc.ETime[e] ? (float)(nowU - cc.ETime[e]) : 0f);
+                for (int s = 0; s < 6; s++) c.EHit[e * 6 + s] = TerrainCache.UnpackHit(cc.EHit[e * 6 + s]);
+                c.EInCache[e] = true;
+                edges++;
+            }
+            _cellsFromCache += cells;
+            if (cells == 0 && edges == 0) return;
+            c.Dirty = true;
+            c.WallsDirty = true;
+            // The neighbours towards -x / -z build their edge quads from this chunk's first row / column.
+            MarkChunkDirty(c.Cx - 1, c.Cz);
+            MarkChunkDirty(c.Cx, c.Cz - 1);
+            MarkChunkDirty(c.Cx - 1, c.Cz - 1);
+        }
+
+        private string CacheStatus(float now)
+        {
+            var tc = _tc;
+            if (!BridgeConfig.TerrainCache.Value) return "cache off";
+            if (tc == null) return "cache idle";
+            var last = TerrainCache.LastSaveUtc;
+            string save = last == DateTime.MinValue ? "never saved" : $"saved {(DateTime.UtcNow - last).TotalSeconds:F0}s ago ({TerrainCache.SavedRegions} files, {TerrainCache.SavedBytes / 1024} KB)";
+            string errs = TerrainCache.SaveErrors + TerrainCache.LoadErrors > 0 ? $", {TerrainCache.SaveErrors} write / {TerrainCache.LoadErrors} read errors" : "";
+            return $"cache {_cellsFromCache} cells loaded ({_cachedLeft} unverified), {tc.ZoneFiles} zone files, "
+                   + $"{tc.RegionsInMemory} regions in memory ({tc.RegionsLoading} loading), {save}{errs}";
+        }
+
+        // ---------------------------------------------------------------------------------------
         // status
         // ---------------------------------------------------------------------------------------
 
@@ -1275,7 +1577,7 @@ namespace UltraRing.Ultrakill.Terrain
                 : $"last batch #{_lastSeq} done, idle";
             _status = $"cells {done} sampled, {_chunks.Count} chunks ({built} built, {dirty} dirty), {batch}, "
                       + $"{_batchRate:F1} batches/s, {_rayRate:F0} rays/s ({_wallRayRate:F0} wall), walls {edges} edges -> {boxes} boxes, "
-                      + $"ground ref {(_haveRef ? _groundRef.ToString("F1") : "-")} m{(DebugDraw ? ", DEBUG VIEW" : "")}";
+                      + $"ground ref {(_haveRef ? _groundRef.ToString("F1") : "-")} m, {CacheStatus(now)}{(DebugDraw ? ", DEBUG VIEW" : "")}";
         }
     }
 }

@@ -20,6 +20,13 @@ namespace UltraRing.Ultrakill.Combat
         public Transform BodyT, HeadT;
         public BoxCollider RootCol, BodyCol, HeadCol;
         public Rigidbody Rb;
+        /// <summary>
+        /// Each hitbox owns a kinematic Rigidbody, like the limbs of a real enemy. Without it Unity reports the root
+        /// (layer 12, tag IgnorePushes) as RaycastHit.transform / Collision.gameObject / Collider.attachedRigidbody and
+        /// every weapon that tag-checks the hit transform (RevolverBeam, Nail, Punch, ...) ignores the proxy.
+        /// </summary>
+        public Rigidbody BodyRb, HeadRb;
+        public bool IsLarge;
         public string StyleType = "zombie";
 
         // ---- host mirror ----
@@ -45,6 +52,9 @@ namespace UltraRing.Ultrakill.Combat
         private static bool _loggedRegisterFailure;
 
         public bool IsAlive => this != null && Eid != null && !LocalDead && !Eid.dead;
+
+        /// <summary>World centre of the whole host box (ULTRAKILL units).</summary>
+        public Vector3 CenterWorld => transform.position + new Vector3(0f, Mathf.Max(_half.y, 0.05f), 0f);
 
         private void Start()
         {
@@ -97,22 +107,25 @@ namespace UltraRing.Ultrakill.Combat
         {
             transform.position = TargetFeet;
             if (Rb != null) Rb.position = TargetFeet;
+            if (BodyRb != null) BodyRb.position = BodyT.position;
+            if (HeadRb != null) HeadRb.position = HeadT.position;
         }
 
         private void FixedUpdate()
         {
             if (Rb == null) return;
-            Vector3 cur = Rb.position;
+            // The root and the hitbox children are separate kinematic bodies; moving the transform hierarchy moves all
+            // of them at the next physics sync (MovePosition on the root alone would leave the children a step behind).
+            Vector3 cur = transform.position;
             Vector3 d = TargetFeet - cur;
             if (d.sqrMagnitude > 36f)
             {
                 transform.position = TargetFeet;
-                Rb.position = TargetFeet;
             }
             else if (d.sqrMagnitude > 1e-8f)
             {
                 // The host publishes ~60 Hz; blend half way each 50 Hz physics step.
-                Rb.MovePosition(Vector3.Lerp(cur, TargetFeet, 0.5f));
+                transform.position = Vector3.Lerp(cur, TargetFeet, 0.5f);
             }
         }
 
@@ -139,6 +152,23 @@ namespace UltraRing.Ultrakill.Combat
             PendingFraction += fractionOfMax;
             PendingHitUk = hitPointUk;
             LastHitTime = Time.unscaledTime;
+        }
+
+        /// <summary>
+        /// Parry damage: a fraction of the host max HP, applied locally and forwarded like any other hit.
+        /// Returns true when it killed the proxy locally.
+        /// </summary>
+        public bool ApplyFractionDamage(float fractionOfMax, Vector3 hitPointUk)
+        {
+            if (Eid == null || LocalDead || Eid.dead || !(fractionOfMax > 0f)) return false;
+            if (!Eid.blessed) Eid.health -= fractionOfMax * UkMax;
+            AddDamage(fractionOfMax, hitPointUk);
+            if (Eid.health <= 0f)
+            {
+                OnLocalDeath();
+                return true;
+            }
+            return false;
         }
 
         /// <summary>Called by the patch when local health reaches zero.</summary>

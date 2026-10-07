@@ -6,6 +6,9 @@
     <Nullable>disable</Nullable>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="..\..\src\UltraRing.Ultrakill\Terrain\TerrainCache.cs" Link="TerrainCache.cs" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\..\src\UltraRing.Link\UltraRing.Link.csproj" />
   </ItemGroup>
 </Project>

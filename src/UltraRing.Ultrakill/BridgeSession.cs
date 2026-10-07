@@ -1,6 +1,7 @@
 using System.Text;
 using UltraRing.Link;
 using UltraRing.Ultrakill.Combat;
+using UltraRing.Ultrakill.Interaction;
 using UltraRing.Ultrakill.Platform;
 using UltraRing.Ultrakill.Render;
 using UltraRing.Ultrakill.Terrain;
@@ -35,6 +36,7 @@ namespace UltraRing.Ultrakill
         private EnemyProxyManager _enemies;
         private FrameCapture _capture;
         private WindowOverlay _overlay;
+        private HostInteraction _interaction;
 
         private ErmcGameState _state;
         private bool _alive;
@@ -72,6 +74,7 @@ namespace UltraRing.Ultrakill
             _enemies = new EnemyProxyManager(root.transform);
             _capture = new FrameCapture();
             _overlay = new WindowOverlay();
+            _interaction = new HostInteraction();
             _showDebug = BridgeConfig.DebugOverlay.Value;
             SceneManager.sceneLoaded += OnSceneLoaded;
         }
@@ -157,6 +160,7 @@ namespace UltraRing.Ultrakill
                          && Link.NowMs - _recallAtMs >= RecallSettleMs && !_holdingForGround && !HostMode && V1.Ready;
             if (ready) Drive(nm);
             else ReleaseControl();
+            _interaction.Tick(Link, Driving, _terrain, Map, nm != null ? V1.Feet(nm) : Vector3.zero);
             _capture.Tick(Link);
         }
 
@@ -304,6 +308,7 @@ namespace UltraRing.Ultrakill
             _lastTotalDamage = ev.totalDamage;
             var nm = V1.Movement;
             if (nm == null || nm.dead || !Driving || hostDamage <= 0f) return;
+            if (Combat.ParrySystem.TryParry(ev, hostDamage)) return; // punched just in time: parried, no damage
             float share = hostDamage / Mathf.Max(ev.hunterMaxHp, 1f);
             int damage = Mathf.Max(1, Mathf.RoundToInt(share * 100f * BridgeConfig.HostDamageScale.Value));
             // invincible: true gives V1 its normal i-frames; a dash (layer 15) dodges the hit like in ULTRAKILL.
@@ -425,6 +430,7 @@ namespace UltraRing.Ultrakill
             sb.AppendLine($"enemies: {_enemies.Status}");
             sb.AppendLine($"capture: {_capture.Status}");
             sb.AppendLine($"window: {_overlay.Status}");
+            sb.AppendLine($"interact: {_interaction.Status}");
             GUI.Label(new Rect(10, 10, 900, 200), sb.ToString());
         }
     }

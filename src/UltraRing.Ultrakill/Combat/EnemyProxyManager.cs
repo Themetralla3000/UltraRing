@@ -32,7 +32,29 @@ namespace UltraRing.Ultrakill.Combat
         private string _lastName = "";
         private bool _loggedCreateFailure;
 
+        /// <summary>The live manager and the mapping of its last tick (used by <see cref="ParrySystem"/>).</summary>
+        internal static EnemyProxyManager Active;
+        internal CoordMap LastMap;
+
         public EnemyProxyManager(Transform parent) => _parent = parent;
+
+        /// <summary>
+        /// Nearest living proxy whose box centre lies within <paramref name="maxUk"/> ULTRAKILL units of
+        /// <paramref name="ukPos"/>; null when none. No allocation.
+        /// </summary>
+        public EnemyProxy Nearest(Vector3 ukPos, float maxUk)
+        {
+            EnemyProxy best = null;
+            float bestSq = maxUk * maxUk;
+            for (int i = 0; i < _list.Count; i++)
+            {
+                var p = _list[i];
+                if (p == null || !p.IsAlive || p.HostDead) continue;
+                float sq = (p.CenterWorld - ukPos).sqrMagnitude;
+                if (sq <= bestSq) { bestSq = sq; best = p; }
+            }
+            return best;
+        }
 
         public string Status =>
             $"{_entityCount} entities, {_list.Count} proxies, {_hitsSent} hits sent" +
@@ -41,6 +63,8 @@ namespace UltraRing.Ultrakill.Combat
         public void Tick(GuestLink link, CoordMap map)
         {
             if (link == null || map == null) return;
+            Active = this;
+            LastMap = map;
             float now = Time.unscaledTime;
             float hpPerUk = Mathf.Max(BridgeConfig.HostHpPerUkHp.Value, 0.01f);
             _tick++;
@@ -67,6 +91,7 @@ namespace UltraRing.Ultrakill.Combat
             _byId.Clear();
             _entityCount = 0;
             _hostileCount = 0;
+            if (Active == this) Active = null;
         }
 
         // ---- per entity ---------------------------------------------------------------------
@@ -152,15 +177,19 @@ namespace UltraRing.Ultrakill.Combat
                 body.layer = layer;
                 body.tag = "Body";
                 var bodyCol = body.AddComponent<BoxCollider>();
+                var bodyRb = AddKinematicBody(body);
 
                 var head = new GameObject("Head");
                 head.transform.SetParent(go.transform, false);
                 head.layer = layer;
                 head.tag = "Head";
                 var headCol = head.AddComponent<BoxCollider>();
+                var headRb = AddKinematicBody(head);
 
                 var eid = go.AddComponent<EnemyIdentifier>();
-                eid.enemyType = large ? EnemyType.Minotaur : EnemyType.Filth;
+                // Minotaur for both: HookArm treats Filth/Soldier/Stray/Drone/... as "light" (the enemy is pulled to V1,
+                // impossible for a host entity); every other type pulls V1 to the enemy. Nothing else keys on it here.
+                eid.enemyType = EnemyType.Minotaur;
                 eid.enemyClass = large ? EnemyClass.Demon : EnemyClass.Husk;
                 eid.dontUnlockBestiary = true;
                 eid.dontCountAsKills = true;
@@ -184,6 +213,9 @@ namespace UltraRing.Ultrakill.Combat
                 proxy.BodyCol = bodyCol;
                 proxy.HeadCol = headCol;
                 proxy.Rb = rb;
+                proxy.BodyRb = bodyRb;
+                proxy.HeadRb = headRb;
+                proxy.IsLarge = large;
                 proxy.StyleType = large ? "spider" : "zombie";
                 proxy.HostMaxHp = e.maxHp;
                 proxy.HostHp = e.hp;
@@ -207,6 +239,14 @@ namespace UltraRing.Ultrakill.Combat
                 if (go != null) UnityEngine.Object.Destroy(go);
                 return null;
             }
+        }
+
+        private static Rigidbody AddKinematicBody(GameObject go)
+        {
+            var rb = go.AddComponent<Rigidbody>();
+            rb.isKinematic = true;
+            rb.useGravity = false;
+            return rb;
         }
 
         private void RemoveStale(GuestLink link, CoordMap map, float now)

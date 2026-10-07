@@ -45,6 +45,19 @@ namespace UltraRing.Ultrakill.Terrain
         public readonly ushort[] Queued = new ushort[Cells];
         public int DoneCount;
 
+        // ---- persistent cache bookkeeping ----
+        /// <summary>The cell came from the cache and has not been re-sampled in this session yet.</summary>
+        public readonly bool[] Cached = new bool[Cells];
+        public int CachedLeft;
+        /// <summary>The cache holds a record for the cell / edge.</summary>
+        public readonly bool[] InCache = new bool[Cells];
+        public readonly bool[] EInCache = new bool[2 * Cells];
+        /// <summary>The cell / edge has data the cache record does not (yet).</summary>
+        public readonly bool[] NeedSave = new bool[Cells];
+        public readonly bool[] ENeedSave = new bool[2 * Cells];
+        /// <summary>Some NeedSave / ENeedSave is set.</summary>
+        public bool CacheDirty;
+
         // ---- horizontal wall rays: two edges per cell (0 = towards +x, 1 = towards +z), index edge * Cells + cell ----
         public readonly byte[] EState = new byte[2 * Cells];
         /// <summary>Which directions were cast: bit0 from this cell towards the neighbour, bit1 from the neighbour back.</summary>

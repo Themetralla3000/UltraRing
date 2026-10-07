@@ -21,6 +21,7 @@ namespace UltraRing.Ultrakill
         public static ConfigEntry<bool> Composite;
         public static ConfigEntry<bool> InputOverlay;
         public static ConfigEntry<KeyCode> SwitchKey;
+        public static ConfigEntry<KeyCode> InteractKey;
         public static ConfigEntry<string> WindowMode;
         public static ConfigEntry<float> CaptureScale;
         public static ConfigEntry<bool> CaptureFlipRows;
@@ -31,6 +32,7 @@ namespace UltraRing.Ultrakill
         public static ConfigEntry<float> TerrainRadius;
         public static ConfigEntry<float> TerrainCell;
         public static ConfigEntry<float> TerrainStepHeight;
+        public static ConfigEntry<bool> TerrainCache;
 
         // Debug
         public static ConfigEntry<bool> DebugOverlay;
@@ -57,6 +59,8 @@ namespace UltraRing.Ultrakill
             InputOverlay = cfg.Bind("Rendering", "InputOverlay", true,
                 "Glue ULTRAKILL's window, nearly transparent, on top of the host window so it receives keyboard and mouse.");
             SwitchKey = cfg.Bind("Rendering", "SwitchKey", KeyCode.F8, "Hand control to the host game and back.");
+            InteractKey = cfg.Bind("Rendering", "InteractKey", KeyCode.V,
+                "Use what the host offers (open doors, pull levers, pick up items, rest at graces). E/Q/R/F/G are ULTRAKILL's.");
             WindowMode = cfg.Bind("Rendering", "WindowMode", "Layered",
                 "How the input window hides itself above the host: Layered (constant opacity 1/255), Region (full-size window clipped to one pixel; use if Layered shows ULTRAKILL opaque) or Tiny (a 1x1 window). Env ULTRARING_WINDOW_MODE overrides.");
 
@@ -75,8 +79,10 @@ namespace UltraRing.Ultrakill
             TerrainCell = cfg.Bind("Terrain", "CellSize", 0.5f, "Horizontal sampling resolution in metres.");
             TerrainStepHeight = cfg.Bind("Terrain", "StepHeight", 0.6f,
                 "Height difference (metres) between neighbouring samples that becomes a wall instead of a slope.");
+            TerrainCache = cfg.Bind("Terrain", "PersistentCache", true,
+                "Keep every sampled terrain cell on disk (<ERMC_DIR>/terrain-cache/<zone>/) so revisited areas have collision instantly; cached cells are re-validated in the background.");
 
-            DebugOverlay = cfg.Bind("Debug", "Overlay", false, "Show bridge diagnostics on screen (toggle with F9).");
+            DebugOverlay =cfg.Bind("Debug", "Overlay", false, "Show bridge diagnostics on screen (toggle with F9).");
         }
     }
 }
