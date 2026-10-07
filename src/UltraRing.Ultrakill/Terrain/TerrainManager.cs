@@ -310,6 +310,9 @@ namespace UltraRing.Ultrakill.Terrain
         /// The reference follows the known floor under V1's feet while V1 is on or near it, and holds while V1 is
         /// airborne, so a jump (or a dash over a pit) never makes the world re-sample.
         /// </summary>
+        /// <summary>V1 was teleported (recall): take the new feet height as the reference on the next tick.</summary>
+        public void ReseedGroundReference() => _haveRef = false;
+
         private void UpdateGroundRef(double feetY, int vcx, int vcz)
         {
             if (!_haveRef)
@@ -320,8 +323,8 @@ namespace UltraRing.Ultrakill.Terrain
             }
             if (TryGetFloor(vcx, vcz, out float fl) && Math.Abs(feetY - fl) <= 1.0)
                 _groundRef = fl;
-            else if (feetY < _groundRef - 12.0)
-                _groundRef = (float)feetY; // fell far below anything sampled: look around V1 again
+            else if (feetY < _groundRef - 12.0 || feetY > _groundRef + LowHeadroom + HighReach * 0.5f)
+                _groundRef = (float)feetY; // far below or above anything sampled: look around V1 again
         }
 
         // ---------------------------------------------------------------------------------------

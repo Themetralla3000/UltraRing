@@ -51,6 +51,11 @@ namespace UltraRing.Ultrakill
                     continue;
                 }
                 if (Keep.Contains(root.name) || root.GetComponent<BridgeMarker>() != null) continue;
+                // SceneHelper instantiates its own EventSystem "(Clone)" at load; the HUD and menus live on canvases;
+                // runtime helpers (gore zones, collider clones) carry nothing physical worth removing.
+                if (root.GetComponentInChildren<UnityEngine.EventSystems.EventSystem>(true) != null) continue;
+                if (root.GetComponentInChildren<Canvas>(true) != null && root.GetComponentInChildren<Collider>(true) == null) continue;
+                if (!HasPhysicalContent(root)) continue;
                 if (HostsSingleton(root))
                 {
                     // Managers living on a scene root must keep running: strip only what is physical or visible.
@@ -66,6 +71,11 @@ namespace UltraRing.Ultrakill
             QualitySettings.vSyncCount = 0;
             Application.targetFrameRate = BridgeConfig.TargetFrameRate.Value;
         }
+
+        /// <summary>Level geometry, lights, triggers or sounds: the things the shell has to remove.</summary>
+        private static bool HasPhysicalContent(GameObject root) =>
+            root.GetComponentInChildren<Collider>(true) != null || root.GetComponentInChildren<Renderer>(true) != null
+            || root.GetComponentInChildren<Light>(true) != null || root.GetComponentInChildren<AudioSource>(true) != null;
 
         /// <summary>True if any behaviour under <paramref name="root"/> derives from MonoSingleton&lt;T&gt;.</summary>
         private static bool HostsSingleton(GameObject root)

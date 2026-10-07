@@ -52,7 +52,7 @@ namespace UltraRing.Ultrakill.Render
 
         private const int MaxW = Protocol.FrameMaxW, MaxH = Protocol.FrameMaxH;
         private const long ResizeStableMs = 600;       // host window size must be stable this long before we follow it
-        private const long PendingTimeoutMs = 750;     // a readback that takes longer counts as an error
+        private const long PendingTimeoutMs = 2000;     // a readback that takes longer counts as an error
         private const long KeepAliveMs = 300;          // re-publish the last control at least this often (host needs < 1 s)
         private const int MaxConsecutiveErrors = 8;
         private const int PoolSize = MaxInFlight + 2;
@@ -219,6 +219,14 @@ namespace UltraRing.Ultrakill.Render
         }
 
         /// <summary>Drop pending captures (control released).</summary>
+        /// <summary>Cancel and give ULTRAKILL its HUD, canvas and layers back (host gone); Submit rebuilds the rig.</summary>
+        public void ReleaseRig()
+        {
+            Cancel();
+            DestroyRig();
+            _haveHostFrame = false;
+        }
+
         public void Cancel()
         {
             foreach (Job j in _queue)

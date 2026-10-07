@@ -54,6 +54,11 @@ namespace UltraRing.Ultrakill
         private bool _wasDead;
         private bool _deathFromHost;
         private bool _controlReleased = true;
+        private bool _clearedStaleControl;
+        private long _hostGoneSinceMs = long.MinValue;
+        private bool _everRecalled;
+        private Vector3 _prePin;
+        private bool _prePinSet;
         private bool _showDebug;
 
         public void Init(GuestLink link)
@@ -73,6 +78,7 @@ namespace UltraRing.Ultrakill
 
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
+            if (mode != LoadSceneMode.Single) return; // e.g. SceneHelper's additive "<scene> - Footsteps" physics scene
             bool bridgeScene = scene.name == LevelShell.SceneName;
             if (bridgeScene == InBridgeScene && !bridgeScene) return;
             InBridgeScene = bridgeScene;
@@ -82,6 +88,8 @@ namespace UltraRing.Ultrakill
             _capture.Teardown();
             Map = null;
             _recallPending = true;
+            _everRecalled = false;
+            _prePinSet = false;
             if (bridgeScene)
             {
                 Plugin.Log.LogInfo("Bridge scene loaded; preparing the shell.");
@@ -108,7 +116,17 @@ namespace UltraRing.Ultrakill
             {
                 if (Driving) Plugin.Log.LogInfo("Host lost; releasing control.");
                 ReleaseControl();
+                if (_hostGoneSinceMs == long.MinValue) _hostGoneSinceMs = Link.NowMs;
+                else if (Link.NowMs - _hostGoneSinceMs > 2000) _capture.ReleaseRig();
                 return;
+            }
+            _hostGoneSinceMs = long.MinValue;
+            if (!_clearedStaleControl)
+            {
+                // A previous guest may have died with COMPOSITE set; the host compositor has no timeout.
+                _clearedStaleControl = true;
+                _controlReleased = false;
+                ReleaseControl();
             }
 
             ReadCounters();
@@ -119,9 +137,10 @@ namespace UltraRing.Ultrakill
             var nm = V1.Movement;
             bool hostAlive = Has(Protocol.StatePlayerValid) && !Has(Protocol.StateHostBusy) && !Has(Protocol.StatePlayerDead);
 
-            if (_recallPending && hostAlive && Map != null && nm != null && nm.activated) DoRecall();
+            if (_recallPending && hostAlive && Map != null && nm != null && (nm.activated || nm.dead)) DoRecall();
+            PinUntilFirstRecall(nm);
 
-            if (Map != null && hostAlive && nm != null)
+            if (Map != null && hostAlive && nm != null && !_recallPending)
             {
                 _terrain.Tick(Link, Map, V1.Feet(nm), nm.rb.velocity);
                 _enemies.Tick(Link, Map);
@@ -207,8 +226,24 @@ namespace UltraRing.Ultrakill
             _recallPending = false;
             _recallAtMs = Link.NowMs;
             _holdingForGround = true;
+            _everRecalled = true;
+            _terrain.ReseedGroundReference();
             PlaceTempFloor(feet);
             Plugin.Log.LogInfo($"Recall: V1 moved to {feet} (yaw {yaw:F0}).");
+        }
+
+        /// <summary>The shell removed every floor: until the host first places V1, keep it from free-falling.</summary>
+        private void PinUntilFirstRecall(NewMovement nm)
+        {
+            if (_everRecalled || nm == null || !nm.activated) return;
+            if (!_prePinSet)
+            {
+                _prePin = nm.transform.position;
+                _prePinSet = true;
+            }
+            nm.rb.velocity = Vector3.zero;
+            nm.rb.position = _prePin;
+            nm.transform.position = _prePin;
         }
 
         /// <summary>
@@ -337,6 +372,7 @@ namespace UltraRing.Ultrakill
             HostMode = true;
             ReleaseControl();
             Link.RequestHostFocus();
+            _capture.ReleaseRig();
             _overlay.EnterHostMode();
             Plugin.Log.LogInfo("Control -> host game (F8 there to come back).");
         }
@@ -355,9 +391,15 @@ namespace UltraRing.Ultrakill
 
         private void Shutdown()
         {
-            ReleaseControl();
-            _capture?.Teardown();
-            _overlay?.Restore();
+            try
+            {
+                ReleaseControl();
+                _capture?.Teardown();
+            }
+            finally
+            {
+                _overlay?.Restore();
+            }
         }
 
         // ---- diagnostics ------------------------------------------------------------------

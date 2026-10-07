@@ -427,8 +427,20 @@ namespace UltraRing.Ultrakill.Platform
                 OnLayeredFailed($"GetLayeredWindowAttributes disagrees (alpha {got}, flags {flags}, wanted {want})");
                 return;
             }
+            SetClickThrough(drawNothing);
             if (_alpha < 0) Plugin.Log.LogInfo($"Layered window: constant alpha {want}/255 accepted by Windows.");
             _alpha = want;
+        }
+
+        /// <summary>
+        /// Alpha 0 alone does not reliably pass mouse input through a layered window; WS_EX_TRANSPARENT does.
+        /// On while ULTRAKILL draws nothing (host busy, V1 not driving), off while V1 is played.
+        /// </summary>
+        private void SetClickThrough(bool on)
+        {
+            long ex = GetExStyle(_hwnd);
+            long want = on ? ex | WS_EX_TRANSPARENT : ex & ~WS_EX_TRANSPARENT;
+            if (want != ex) SetLong(_hwnd, GWL_EXSTYLE, want, out _);
         }
 
         private void OnLayeredFailed(string why)
