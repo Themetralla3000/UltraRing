@@ -70,6 +70,15 @@ if ($FakeHost) {
     if (-not (Get-Process steam -ErrorAction SilentlyContinue)) { Write-Warning 'Steam is not running; Elden Ring needs the Steam client (offline mode is fine).' }
     $HostProcess = Get-Process eldenring -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $GameExe } | Select-Object -First 1
     if (-not $HostProcess) {
+        # Exclusive fullscreen minimises Elden Ring whenever ULTRAKILL's input window takes the focus.
+        $GraphicsConfig = Join-Path $env:APPDATA 'EldenRing\GraphicsConfig.xml'
+        if (Test-Path -LiteralPath $GraphicsConfig) {
+            $Xml = [IO.File]::ReadAllText($GraphicsConfig, [Text.Encoding]::Unicode)
+            if ($Xml -match '<ScreenMode>FULLSCREEN</ScreenMode>') {
+                [IO.File]::WriteAllText($GraphicsConfig, ($Xml -replace '<ScreenMode>FULLSCREEN</ScreenMode>', '<ScreenMode>BORDERLESS</ScreenMode>'), [Text.Encoding]::Unicode)
+                Write-Output 'Elden Ring screen mode: fullscreen -> borderless (required by the input overlay; the original is in the Install backup).'
+            }
+        }
         Write-Output 'Starting Elden Ring...'
         $HostProcess = Start-Process -FilePath $GameExe -WorkingDirectory $Install.eldenring.game_dir -PassThru
     }

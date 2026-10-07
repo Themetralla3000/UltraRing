@@ -314,14 +314,19 @@ namespace UltraRing.Ultrakill.Render
             return null;
         }
 
+        private int _hostW, _hostH;
+
         private void ComputeSize(GuestLink link, out int w, out int h)
         {
-            int sw = Screen.width, sh = Screen.height;
-            if (link.Snapshot(out ErmcGameState st) && (st.flags & Protocol.StateWindowValid) != 0 && st.winW > 0 && st.winH > 0)
+            // Follow the host's back buffer (the compositor stretches us over it); keep the last known size while the
+            // host state flickers (resize, alt-tab) so frames never bounce between sizes, which costs the host a
+            // texture rebuild each time. ULTRAKILL's own window is one pixel shorter on purpose: never use it here.
+            if (link.Snapshot(out ErmcGameState st) && (st.flags & Protocol.StateWindowValid) != 0)
             {
-                sw = st.winW;
-                sh = st.winH;
+                if (st.bbW > 0 && st.bbH > 0) { _hostW = (int)st.bbW; _hostH = (int)st.bbH; }
+                else if (st.winW > 0 && st.winH > 0) { _hostW = st.winW; _hostH = st.winH; }
             }
+            int sw = _hostW > 0 ? _hostW : Screen.width, sh = _hostH > 0 ? _hostH : Screen.height;
             double s = Math.Max(0.1, Math.Min(1.0, Scale));
             double fw = Math.Max(2, sw) * s, fh = Math.Max(2, sh) * s;
             double cap = Math.Min(1.0, Math.Min(MaxW / fw, MaxH / fh));

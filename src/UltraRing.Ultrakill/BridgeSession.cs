@@ -105,6 +105,7 @@ namespace UltraRing.Ultrakill
         private void Update()
         {
             if (Input.GetKeyDown(KeyCode.F9)) _showDebug = !_showDebug;
+            if (Input.GetKeyDown(KeyCode.F10)) Terrain.TerrainManager.DebugDraw = !Terrain.TerrainManager.DebugDraw;
             if (!InBridgeScene || !_alive) return;
             if (Input.GetKeyDown(BridgeConfig.SwitchKey.Value) && !HostMode) EnterHostMode();
         }

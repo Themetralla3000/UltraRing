@@ -28,6 +28,8 @@ namespace UltraRing.Ultrakill.Terrain
         /// <summary>Ceiling tiles are enlarged by this (metres) on every side.</summary>
         private const double CeilGrow = 0.01;
         private const float MinCross2 = 1e-10f;
+        /// <summary>Floor triangles are enlarged by this (metres) on every side so neighbours overlap and no crack remains.</summary>
+        private const float FloorGrowMetres = 0.012f;
 
         public readonly List<Vector3> FloorV = new List<Vector3>(4096);
         public readonly List<int> FloorT = new List<int>(4096);
@@ -37,6 +39,9 @@ namespace UltraRing.Ultrakill.Terrain
         public readonly List<int> CeilT = new List<int>(1024);
 
         private CoordMap _map;
+        private float _grow; // FloorGrowMetres in ULTRAKILL units
+        private readonly List<int> _fillIdx = new List<int>();
+        private readonly List<float> _fillVal = new List<float>();
 
         /// <summary>
         /// <paramref name="floors"/> is a 17 x 17 grid (row = z, column = x) of cell floors starting at cell
@@ -46,6 +51,8 @@ namespace UltraRing.Ultrakill.Terrain
         public void Build(CoordMap map, int x0, int z0, float cell, float step, float[] floors, float[] ceils)
         {
             _map = map;
+            _grow = FloorGrowMetres / map.MetresPerUnit;
+            FillGaps(floors, step);
             FloorV.Clear(); FloorT.Clear();
             WallV.Clear(); WallT.Clear();
             CeilV.Clear(); CeilT.Clear();
@@ -93,19 +100,19 @@ namespace UltraRing.Ultrakill.Terrain
                             Vector3 vA = Uk(xa, hA, za), vB = Uk(xb, hB, za), vC = Uk(xb, hC, zb), vD = Uk(xa, hD, zb);
                             if (Math.Abs(hA - hC) <= Math.Abs(hB - hD))
                             {
-                                Tri(FloorV, FloorT, vA, vB, vC, up);
-                                Tri(FloorV, FloorT, vA, vC, vD, up);
+                                Tri(FloorV, FloorT, vA, vB, vC, up, _grow);
+                                Tri(FloorV, FloorT, vA, vC, vD, up, _grow);
                             }
                             else
                             {
-                                Tri(FloorV, FloorT, vA, vB, vD, up);
-                                Tri(FloorV, FloorT, vB, vC, vD, up);
+                                Tri(FloorV, FloorT, vA, vB, vD, up, _grow);
+                                Tri(FloorV, FloorT, vB, vC, vD, up, _grow);
                             }
                         }
-                        else if (!a) Tri(FloorV, FloorT, Uk(xb, hB, za), Uk(xb, hC, zb), Uk(xa, hD, zb), up);
-                        else if (!b) Tri(FloorV, FloorT, Uk(xa, hA, za), Uk(xb, hC, zb), Uk(xa, hD, zb), up);
-                        else if (!c) Tri(FloorV, FloorT, Uk(xa, hA, za), Uk(xb, hB, za), Uk(xa, hD, zb), up);
-                        else Tri(FloorV, FloorT, Uk(xa, hA, za), Uk(xb, hB, za), Uk(xb, hC, zb), up);
+                        else if (!a) Tri(FloorV, FloorT, Uk(xb, hB, za), Uk(xb, hC, zb), Uk(xa, hD, zb), up, _grow);
+                        else if (!b) Tri(FloorV, FloorT, Uk(xa, hA, za), Uk(xb, hC, zb), Uk(xa, hD, zb), up, _grow);
+                        else if (!c) Tri(FloorV, FloorT, Uk(xa, hA, za), Uk(xb, hB, za), Uk(xa, hD, zb), up, _grow);
+                        else Tri(FloorV, FloorT, Uk(xa, hA, za), Uk(xb, hB, za), Uk(xb, hC, zb), up, _grow);
                         continue;
                     }
 
@@ -126,8 +133,8 @@ namespace UltraRing.Ultrakill.Terrain
         private void Flat(double x1, double x2, double z1, double z2, float h)
         {
             Vector3 p1 = Uk(x1, h, z1), p2 = Uk(x2, h, z1), p3 = Uk(x2, h, z2), p4 = Uk(x1, h, z2);
-            Tri(FloorV, FloorT, p1, p2, p3, Vector3.up);
-            Tri(FloorV, FloorT, p1, p3, p4, Vector3.up);
+            Tri(FloorV, FloorT, p1, p2, p3, Vector3.up, _grow);
+            Tri(FloorV, FloorT, p1, p3, p4, Vector3.up, _grow);
         }
 
         /// <summary>Wall in the plane x = <paramref name="x"/>; <paramref name="hNeg"/> is the floor on the -x side.</summary>
@@ -177,9 +184,44 @@ namespace UltraRing.Ultrakill.Terrain
 
         private Vector3 Uk(double hostX, float hostY, double hostZ) => _map.ToUk(hostX, hostY, hostZ);
 
-        /// <summary>Adds a triangle wound so that its front face looks along <paramref name="facing"/>; skips degenerate ones.</summary>
-        private static void Tri(List<Vector3> v, List<int> t, Vector3 a, Vector3 b, Vector3 c, Vector3 facing)
+        private static Vector3 Grow(Vector3 p, float mx, float mz, float g)
         {
+            float dx = p.x - mx, dz = p.z - mz;
+            float l = Mathf.Sqrt(dx * dx + dz * dz);
+            if (l < 1e-6f) return p;
+            return new Vector3(p.x + dx / l * g, p.y, p.z + dz / l * g);
+        }
+
+        /// <summary>
+        /// A single missing sample between two floors at a similar height (a ray that failed, a thin pillar the floor ray
+        /// started inside) would leave a half-metre hole V1 falls through: fill it with the neighbours' average.
+        /// </summary>
+        private void FillGaps(float[] g, float step)
+        {
+            _fillIdx.Clear(); _fillVal.Clear();
+            for (int j = 1; j < Grid - 1; j++)
+            {
+                for (int i = 1; i < Grid - 1; i++)
+                {
+                    int k = j * Grid + i;
+                    if (!float.IsNaN(g[k])) continue;
+                    float l = g[k - 1], r = g[k + 1], d = g[k - Grid], u = g[k + Grid];
+                    if (!float.IsNaN(l) && !float.IsNaN(r) && Math.Abs(l - r) <= step) { _fillIdx.Add(k); _fillVal.Add((l + r) * 0.5f); }
+                    else if (!float.IsNaN(d) && !float.IsNaN(u) && Math.Abs(d - u) <= step) { _fillIdx.Add(k); _fillVal.Add((d + u) * 0.5f); }
+                }
+            }
+            for (int n = 0; n < _fillIdx.Count; n++) g[_fillIdx[n]] = _fillVal[n];
+        }
+
+        /// <summary>Adds a triangle wound so that its front face looks along <paramref name="facing"/>; skips degenerate ones.</summary>
+        private static void Tri(List<Vector3> v, List<int> t, Vector3 a, Vector3 b, Vector3 c, Vector3 facing, float grow = 0f)
+        {
+            if (grow > 0f)
+            {
+                // Push every corner outwards (horizontally) from the centroid.
+                float mx = (a.x + b.x + c.x) / 3f, mz = (a.z + b.z + c.z) / 3f;
+                a = Grow(a, mx, mz, grow); b = Grow(b, mx, mz, grow); c = Grow(c, mx, mz, grow);
+            }
             Vector3 cr = Vector3.Cross(b - a, c - a);
             if (cr.sqrMagnitude < MinCross2) return;
             int i = v.Count;
