@@ -12,7 +12,7 @@ What UltraRing takes from them:
 - **The Elden Ring host DLLs** (`dinput8.dll`, `erbridge_core.dll`) are compiled, unchanged, from Minecraft Ring's
   `bridge-base/elden-ring/er-bridge` sources at commit `711015afa67ab25c7b9597c68038718d1cef322e`. `tools/Build.ps1`
   fetches that commit into `external/minecraft-ring`; the sources are not copied into this repository.
-- **The shared-memory protocol**: `src/UltraRing.Link/Protocol.cs` is a C# transcription of Minecraft Ring's
+- **The shared-memory protocol**: the C# transcription (now in the ULTRAKILL Crossover Bridge kit, see below) is a transcription of Minecraft Ring's
   `bridge_protocol.h` (layout, offsets and semantics), so the unchanged host DLL can talk to ULTRAKILL.
 - **The launcher and installer flow** (`Install.ps1`, `Launch.ps1`, `Restore.ps1`) is adapted from Minecraft Ring's
   scripts, and the guest behaviour (recall, shared life, F8 switching, input window, frame passthrough, terrain
@@ -63,3 +63,9 @@ release; it is not part of this repository.
 ULTRAKILL (New Blood Interactive / Arsi "Hakita" Patala) and Elden Ring (FromSoftware / Bandai Namco) are not
 included. You need your own copies. Game names and assets belong to their owners; the MIT License covers the bridge
 code only and grants no rights to either game.
+
+## ULTRAKILL Crossover Bridge (MIT)
+
+The ULTRAKILL guest, the protocol library, the host SDK and the fake host are in
+[ULTRAKILL Crossover Bridge](https://github.com/Themetralla3000/ultrakill-crossover-bridge) (Copyright (c) 2026 Arnau Encinas, same author as UltraRing, MIT License),
+included as the git submodule `bridge/`. Its own THIRD_PARTY_NOTICES.md covers what it uses (BepInEx, HarmonyX, ...).

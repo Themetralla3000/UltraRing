@@ -6,13 +6,12 @@
     - refuses to run while eldenring.exe is running
     - backs up %APPDATA%\EldenRing (saves) and moves conflicting mod files out of the game folder into backups\<timestamp>
     - copies dinput8.dll and erbridge\erbridge_core.dll, writes steam_appid.txt (1245620)
-  ULTRAKILL (guest):
-    - copies BepInEx's winhttp.dll (Doorstop proxy) and a doorstop_config.ini with enabled=false next to ULTRAKILL.exe,
-      so a normal Steam launch stays vanilla. Launch.ps1 enables BepInEx for its own launch with
-      --doorstop-enabled true --doorstop-target-assembly <repo>\runtime\ultrakill-bepinex\BepInEx\core\BepInEx.Preloader.dll
-      so no BepInEx folder, plugin or config is ever copied into the game folder.
-    - backs up an existing winhttp.dll / doorstop_config.ini first.
-  Everything is recorded in installation.json (used by Launch.ps1 and Restore.ps1). Running Install.ps1 again for
+  ULTRAKILL (guest) is delegated to the ULTRAKILL Crossover Bridge kit (bridge\scripts\Install-Guest.ps1): it copies
+    BepInEx's winhttp.dll (Doorstop proxy) and a doorstop_config.ini with enabled=false next to ULTRAKILL.exe, so a
+    normal Steam launch stays vanilla; Launch.ps1 enables BepInEx for its own launch only. Backups of existing files
+    go to the kit's runtime\backups.
+  Everything is recorded in installation.json (used by Launch.ps1 and Restore.ps1; the kit keeps its own
+  bridge\runtime\guest-install.json). Running Install.ps1 again for
   the same folders only refreshes the files; the original backups are kept.
 .PARAMETER EldenRingDir
   The folder containing eldenring.exe (default: the Steam path).
@@ -21,7 +20,7 @@
 .PARAMETER UltrakillSteamAppId
   Also write steam_appid.txt (1229490) next to ULTRAKILL.exe. Off by default: ULTRAKILL uses Facepunch.Steamworks and
   never calls RestartAppIfNecessary, so starting ULTRAKILL.exe directly (Steam running) works without it. Use this
-  only if Launch.ps1's ULTRAKILL exits at once or "restarts through Steam" (which would lose the BepInEx arguments).
+  only if the launched ULTRAKILL exits at once or "restarts through Steam" (which would lose the BepInEx arguments).
 .PARAMETER SkipEldenRing
   Install only the ULTRAKILL side.
 .PARAMETER SkipUltrakill
@@ -48,7 +47,10 @@ function Assert-Inside([string]$Dir, [string]$Candidate) {
 # ---------------------------------------------------------------- checks
 if ($SkipEldenRing -and $SkipUltrakill) { throw 'Nothing to install.' }
 $NativeDist = Join-Path $ProjectRoot 'external\minecraft-ring\dist'
-$UkStage = Join-Path $ProjectRoot 'runtime\ultrakill-bepinex'
+$Kit = Join-Path $ProjectRoot 'bridge'
+$KitInstall = Join-Path $Kit 'scripts\Install-Guest.ps1'
+$UkStage = Join-Path $Kit 'dist\guest'
+$KitRecord = Join-Path $Kit 'runtime\guest-install.json' 
 if (-not $SkipEldenRing) {
     $EldenRingDir = Resolve-Dir $EldenRingDir
     if (Get-Process eldenring -ErrorAction SilentlyContinue) { throw 'Close Elden Ring before installation.' }
@@ -61,8 +63,9 @@ if (-not $SkipUltrakill) {
     $UltrakillDir = Resolve-Dir $UltrakillDir
     if (Get-Process ULTRAKILL -ErrorAction SilentlyContinue) { throw 'Close ULTRAKILL before installation.' }
     if (-not (Test-Path -LiteralPath "$UltrakillDir\ULTRAKILL.exe")) { throw "ULTRAKILL.exe was not found in '$UltrakillDir'. Pass -UltrakillDir." }
+    if (-not (Test-Path -LiteralPath $KitInstall)) { throw 'The ULTRAKILL Crossover Bridge submodule (bridge\) is not initialised. Run: git submodule update --init' }
     if (-not (Test-Path -LiteralPath "$UkStage\winhttp.dll") -or -not (Test-Path -LiteralPath "$UkStage\BepInEx\core\BepInEx.Preloader.dll")) {
-        throw "The BepInEx runtime is not staged at $UkStage. Run tools\Build.ps1 first."
+        throw "The guest is not staged at $UkStage. Run tools\Build.ps1 first."
     }
 }
 
@@ -138,63 +141,36 @@ if (-not $SkipEldenRing) {
     Write-Output 'Note: Launch.ps1 switches Elden Ring from FULLSCREEN to BORDERLESS in GraphicsConfig.xml (needed so it does not minimise when ULTRAKILL takes focus). Restore.ps1 offers to undo that.'
 }
 
-# ---------------------------------------------------------------- ULTRAKILL (guest)
+# ---------------------------------------------------------------- ULTRAKILL (guest, via the kit)
 if (-not $SkipUltrakill) {
-    if ($PrevUk) {
-        $UkBackup = [string]$PrevUk.backup
-        $UkBackedUp = @($PrevUk.backed_up)
-        $UkCreatedAppId = [bool]$PrevUk.created_steam_appid
-        Write-Output 'ULTRAKILL: already installed here, refreshing the bridge files.'
-    } else {
-        $UkBackup = Join-Path $BackupRoot 'ultrakill'
-        New-Item -ItemType Directory -Path $UkBackup -Force | Out-Null
-        $UkBackedUp = @()
-        foreach ($Name in 'winhttp.dll', 'doorstop_config.ini') {
-            $Candidate = [IO.Path]::GetFullPath((Join-Path $UltrakillDir $Name))
-            Assert-Inside $UltrakillDir $Candidate
-            if (Test-Path -LiteralPath $Candidate) {
-                Move-Item -LiteralPath $Candidate -Destination (Join-Path $UkBackup $Name)
-                $UkBackedUp += $Name
-            }
-        }
-        $UkCreatedAppId = $false
+    # Installation made by UltraRing 0.2.0 (backup + backed_up in installation.json, no kit record): hand it to the kit
+    # as its own record so the original backups are kept and Uninstall-Guest.ps1 restores them.
+    if ($PrevUk -and -not $PrevUk.guest_record -and -not (Test-Path -LiteralPath $KitRecord)) {
+        New-Item -ItemType Directory -Path (Split-Path -Parent $KitRecord) -Force | Out-Null
+        ([ordered]@{
+            installed_at = (Get-Date).ToString('o')
+            game_dir = $UltrakillDir
+            guest_dir = $UkStage
+            backup = [string]$PrevUk.backup
+            backed_up = @($PrevUk.backed_up)
+            created_steam_appid = [bool]$PrevUk.created_steam_appid
+        } | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $KitRecord -Encoding UTF8
+        Write-Output 'ULTRAKILL: migrated the 0.2.0 installation record to the kit.'
     }
-    Copy-Item -LiteralPath "$UkStage\winhttp.dll" -Destination "$UltrakillDir\winhttp.dll" -Force
-    # Doorstop reads this next to the exe. enabled=false: a normal Steam launch stays vanilla; Launch.ps1 passes
-    # --doorstop-enabled true --doorstop-target-assembly <path> to switch BepInEx on for its own launch only.
-    $Ini = @(
-        '# UltraRing: BepInEx is OFF for normal launches. Launch.ps1 enables it on the command line.',
-        '[General]',
-        'enabled = false',
-        'target_assembly = BepInEx\core\BepInEx.Preloader.dll',
-        'redirect_output_log = false',
-        'boot_config_override =',
-        'ignore_disable_switch = false',
-        '',
-        '[UnityMono]',
-        'dll_search_path_override =',
-        'debug_enabled = false',
-        'debug_address = 127.0.0.1:10000',
-        'debug_suspend = false'
-    )
-    Set-Content -LiteralPath "$UltrakillDir\doorstop_config.ini" -Value $Ini -Encoding ASCII
-    if ($UltrakillSteamAppId) {
-        $AppIdPath = "$UltrakillDir\steam_appid.txt"
-        if (Test-Path -LiteralPath $AppIdPath) {
-            Write-Output 'ULTRAKILL: steam_appid.txt already exists; left alone.'
-        } else {
-            '1229490' | Set-Content -LiteralPath $AppIdPath -Encoding ASCII
-            $UkCreatedAppId = $true
-        }
-    }
+    $KitArgs = @{ UltrakillDir = $UltrakillDir; GuestDir = $UkStage }
+    if ($UltrakillSteamAppId) { $KitArgs.SteamAppId = $true }
+    & $KitInstall @KitArgs
+    $Guest = $null
+    if (Test-Path -LiteralPath $KitRecord) { $Guest = Get-Content -LiteralPath $KitRecord -Raw | ConvertFrom-Json }
+    if (-not $Guest) { throw "Install-Guest.ps1 did not write $KitRecord." }
     $Record.ultrakill = [ordered]@{
         game_dir = $UltrakillDir
-        backup = $UkBackup
-        backed_up = $UkBackedUp
-        created_steam_appid = $UkCreatedAppId
+        guest_record = $KitRecord
+        backup = [string]$Guest.backup
+        backed_up = @($Guest.backed_up)
+        created_steam_appid = [bool]$Guest.created_steam_appid
         staged_runtime = $UkStage
     }
-    Write-Output "ULTRAKILL: installed (BepInEx disabled by default; Launch.ps1 enables it). Backed up: $($UkBackedUp.Count) file(s)."
 }
 
 ($Record | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $RecordPath -Encoding UTF8

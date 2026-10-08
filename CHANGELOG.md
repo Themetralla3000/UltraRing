@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased / 0.3.0
+
+Split into two repositories. The ULTRAKILL side now lives in the reusable
+[ULTRAKILL Crossover Bridge](https://github.com/Themetralla3000/ultrakill-crossover-bridge) kit (v0.1.0), consumed here as the git submodule `bridge/`.
+UltraRing is now the Elden Ring host integration: Minecraft Ring's host DLLs, Elden Ring install/launch/restore, docs.
+
+- **Removed** `src/UltraRing.Link`, `src/UltraRing.Ultrakill`, `tools/UltraRing.FakeHost`, `tests/UltraRing.Link.Tests` and `UltraRing.sln`
+  (now `UltrakillBridge.Protocol`, `UltrakillBridge.Guest`, the kit's fake host and tests).
+- **Build.ps1** builds the host DLLs, then calls `bridge\scripts\Build.ps1`; the guest is staged at `bridge\dist\guest`
+  (was `runtime\ultrakill-bepinex`). Needs `git clone --recursive` / `git submodule update --init`.
+- **Install/Restore/Launch/Stop** delegate the ULTRAKILL part to the kit's `Install-Guest`, `Uninstall-Guest`, `Launch-Guest`, `Stop-Guest`;
+  `-FakeHost` uses the kit's `Run-FakeHost.ps1`. An `installation.json` from 0.2.0 keeps working.
+- **Renamed:** plugin GUID `dev.ukbridge.guest`, config `dev.ukbridge.guest.cfg` (Build.ps1 copies your old config over once),
+  `ULTRARING_WINDOW_MODE` -> `UKBRIDGE_WINDOW_MODE`, bridge dir variable `UKBRIDGE_DIR` (`ERMC_DIR` is still read).
+- Research notes in `docs/research/` are kept as history; current docs are in the kit.
+
 ## 0.2.0 — 2026-10-08
 
 First version played in Elden Ring (only lightly tested so far).

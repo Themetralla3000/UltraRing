@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-  Starts the bridge: the host (Elden Ring, or the FakeHost test tool) first, then ULTRAKILL with BepInEx.
+  Starts the bridge: the host (Elden Ring, or the FakeHost test tool) first, then ULTRAKILL as the guest (bridge\scripts\Launch-Guest.ps1 of the ULTRAKILL Crossover Bridge kit).
 .PARAMETER FakeHost
-  Start tools\UltraRing.FakeHost (a fake Elden Ring on the same protocol) instead of Elden Ring. Needs no Elden Ring
-  installation; only the ULTRAKILL side of Install.ps1.
+  Start the kit's fake host (bridge\scripts\Run-FakeHost.ps1, a fake host on the same protocol) instead of Elden
+  Ring. Needs no Elden Ring installation; only the ULTRAKILL side of Install.ps1.
 .PARAMETER HostOnly
   Start (and wait for) the host only; do not start ULTRAKILL.
 #>
@@ -19,15 +19,17 @@ if (-not (Test-Path -LiteralPath $RecordPath)) { throw 'The bridge is not instal
 $Install = Get-Content -LiteralPath $RecordPath -Raw | ConvertFrom-Json
 
 $RuntimeDir = Join-Path $ProjectRoot 'runtime'
-$UkStage = Join-Path $RuntimeDir 'ultrakill-bepinex'
-$Preloader = Join-Path $UkStage 'BepInEx\core\BepInEx.Preloader.dll'
-$Plugin = Join-Path $UkStage 'BepInEx\plugins\UltraRing\UltraRing.Ultrakill.dll'
+$KitScripts = Join-Path $ProjectRoot 'bridge\scripts'
+$UkStage = Join-Path $ProjectRoot 'bridge\dist\guest'
+if (-not (Test-Path -LiteralPath (Join-Path $KitScripts 'Launch-Guest.ps1'))) {
+    throw 'The ULTRAKILL Crossover Bridge submodule (bridge\) is not initialised. Run: git submodule update --init'
+}
 if (-not $HostOnly) {
     if (-not $Install.ultrakill) { throw 'ULTRAKILL is not installed (run Install.ps1 without -SkipUltrakill).' }
     $UkExe = Join-Path $Install.ultrakill.game_dir 'ULTRAKILL.exe'
     if (-not (Test-Path -LiteralPath $UkExe)) { throw "ULTRAKILL was not found: $UkExe" }
-    if (-not (Test-Path -LiteralPath $Preloader) -or -not (Test-Path -LiteralPath $Plugin)) {
-        throw "The staged BepInEx runtime is incomplete ($UkStage). Run tools\Build.ps1."
+    if (-not (Test-Path -LiteralPath (Join-Path $UkStage 'BepInEx\core\BepInEx.Preloader.dll'))) {
+        throw "The staged guest is incomplete ($UkStage). Run tools\Build.ps1."
     }
 }
 
@@ -41,14 +43,10 @@ $SharedFile = Join-Path $RuntimeDir 'bridge.shm'
 
 # ---------------------------------------------------------------- host
 if ($FakeHost) {
-    $HostName = 'UltraRing.FakeHost'
-    $FakeExe = Join-Path $ProjectRoot 'tools\UltraRing.FakeHost\bin\Release\net8.0-windows\UltraRing.FakeHost.exe'
-    $HostProcess = Get-Process $HostName -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $HostProcess) {
-        if (-not (Test-Path -LiteralPath $FakeExe)) { throw "FakeHost is not built ($FakeExe). Run tools\Build.ps1." }
-        Write-Output 'Starting the FakeHost (fake Elden Ring)...'
-        $HostProcess = Start-Process -FilePath $FakeExe -ArgumentList @('--dir', ('"' + $RuntimeDir + '"')) -WorkingDirectory (Split-Path -Parent $FakeExe) -PassThru
-    }
+    # The kit's fake host: builds it if needed, starts it on $RuntimeDir and waits until it has published the bridge.
+    & (Join-Path $KitScripts 'Run-FakeHost.ps1') -BridgeDir $RuntimeDir
+    $HostProcess = Get-Process 'UltrakillBridge.FakeHost' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $HostProcess) { throw 'The fake host is not running.' }
 } else {
     if (-not $Install.eldenring) { throw 'Elden Ring is not installed (run Install.ps1 without -SkipEldenRing), or use -FakeHost.' }
     $GameExe = Join-Path $Install.eldenring.game_dir 'eldenring.exe'
@@ -112,22 +110,6 @@ Write-Output "Host bridge ready (PID $($HostProcess.Id))."
 if (-not $FakeHost) { Write-Output 'In Elden Ring, choose Continue and load into the world.' }
 if ($HostOnly) { return }
 
-# ---------------------------------------------------------------- guard against a second ULTRAKILL guest
-$State = Read-BridgeHeader $SharedFile
-if ($State -and $State.GuestProcessId -gt 0) {
-    $Guest = Get-Process -Id $State.GuestProcessId -ErrorAction SilentlyContinue
-    if ($Guest -and $Guest.ProcessName -eq 'ULTRAKILL') {
-        $StartedMs = [DateTimeOffset]::new($Guest.StartTime).ToUnixTimeMilliseconds()
-        if ([Math]::Abs([double]$StartedMs - [double]$State.GuestStartMs) -lt 120000) {
-            Write-Output "ULTRAKILL is already attached to the bridge (PID $($Guest.Id)). Use F8 to switch control."
-            return
-        }
-    }
-}
-if (Get-Process ULTRAKILL -ErrorAction SilentlyContinue) {
-    throw 'ULTRAKILL is already running without the bridge. Close it first (BepInEx can only be enabled at startup).'
-}
-
 # A previous ULTRAKILL that was killed leaves COMPOSITE/MOVE_HUNTER set (the host never times it out): clear it.
 $State = Read-BridgeHeader $SharedFile
 if ($State -and $State.ControlFlags -ne 0) {
@@ -138,25 +120,13 @@ if ($State -and $State.ControlFlags -ne 0) {
     }
 }
 
-# ---------------------------------------------------------------- ULTRAKILL with BepInEx
-# doorstop_config.ini in the game folder says enabled=false; the command line switches BepInEx on for this launch only.
-$UkArgs = '--doorstop-enabled true --doorstop-target-assembly "' + $Preloader + '" -screen-fullscreen 0 -popupwindow'
-Write-Output 'Starting ULTRAKILL with BepInEx...'
-$UkProcess = Start-Process -FilePath $UkExe -ArgumentList $UkArgs -WorkingDirectory $Install.ultrakill.game_dir -PassThru
+# ---------------------------------------------------------------- ULTRAKILL guest (the kit)
+# Launch-Guest.ps1 refuses a second guest, enables BepInEx for this launch only and waits for the guest to attach.
+& (Join-Path $KitScripts 'Launch-Guest.ps1') -BridgeDir $RuntimeDir -UltrakillDir ([string]$Install.ultrakill.game_dir) -GuestDir $UkStage
 
-$Watch.Restart()
-$Attached = $false
-while ($Watch.Elapsed.TotalSeconds -lt 60) {
-    $State = Read-BridgeHeader $SharedFile
-    if ($State -and $State.GuestProcessId -eq $UkProcess.Id) { $Attached = $true; break }
-    if (-not (Get-Process -Id $UkProcess.Id -ErrorAction SilentlyContinue)) {
-        throw "ULTRAKILL exited during startup. See $UkStage\BepInEx\LogOutput.log and the Unity player log."
-    }
-    Start-Sleep -Milliseconds 500
-}
-
+$State = Read-BridgeHeader $SharedFile
 Write-Output ''
-Write-Output "Host      : PID $($HostProcess.Id) $(if ($FakeHost) { '(FakeHost)' } else { '(Elden Ring)' })"
-Write-Output "ULTRAKILL : PID $($UkProcess.Id) $(if ($Attached) { '(attached to the bridge)' } else { '(not attached yet; see ' + $UkStage + '\BepInEx\LogOutput.log)' })"
+Write-Output "Host      : PID $($HostProcess.Id) $(if ($FakeHost) { '(fake host)' } else { '(Elden Ring)' })"
+if ($State -and $State.GuestProcessId -gt 0) { Write-Output "ULTRAKILL : PID $($State.GuestProcessId) (attached to the bridge)" }
 Write-Output "Bridge dir: $RuntimeDir"
-Write-Output 'F8 hands control to the host and back. Logs: runtime\er-bridge.log, runtime\ultrakill-bepinex\BepInEx\LogOutput.log'
+Write-Output 'F8 hands control to the host and back. Logs: runtime\er-bridge.log, bridge\dist\guest\BepInEx\LogOutput.log'

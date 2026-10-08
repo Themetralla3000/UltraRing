@@ -5,13 +5,15 @@
 [![Windows x64](https://img.shields.io/badge/platform-Windows_x64-0078D4)](#requirements)
 [![Elden Ring 1.17.1](https://img.shields.io/badge/Elden_Ring-1.17.1-C8A24A)](#requirements)
 [![ULTRAKILL](https://img.shields.io/badge/ULTRAKILL-Steam-B22222)](#requirements)
-[![Status: experimental](https://img.shields.io/badge/status-experimental_0.2.0-D9A441)](CHANGELOG.md)
+[![Status: experimental](https://img.shields.io/badge/status-experimental_0.3.0-D9A441)](CHANGELOG.md)
 [![MIT license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 UltraRing runs real ULTRAKILL alongside real Elden Ring. ULTRAKILL handles the player: V1's movement,
 dashes, slides, slams, wall jumps, every weapon, the whiplash, parries and the HUD. Elden Ring keeps its
 own world, enemies, bosses, items and saves, and draws the final image with V1's arm, gun and HUD
 composited into it. Both games stay open for the whole session.
+
+> **The ULTRAKILL side lives in [ULTRAKILL Crossover Bridge](https://github.com/Themetralla3000/ultrakill-crossover-bridge)** (guest plugin, protocol, host SDK, fake host), so anyone can put V1 into other games. UltraRing is the Elden Ring host integration: Minecraft Ring's host DLLs, plus the install/launch/restore tooling for Elden Ring. The kit is a git submodule (`bridge/`).
 
 ### Built on Minecraft Ring
 
@@ -27,7 +29,7 @@ running inside Elden Ring), itself based on
 - the install/launch/restore scripts and the guest-side design (recalls, shared life, F8, input window, frame
   passthrough) are adapted from theirs.
 
-UltraRing's own part is the ULTRAKILL side: plugging V1 in where Minecraft used to be. All three projects are MIT
+The ULTRAKILL side (plugging V1 in where Minecraft used to be) now lives in the [ULTRAKILL Crossover Bridge](https://github.com/Themetralla3000/ultrakill-crossover-bridge). All three projects are MIT
 licensed; their notices are kept in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 > **Experimental and vibe-coded.** This project was built with AI in a simple feedback loop: describe the goal,
@@ -71,7 +73,7 @@ The interact and switch keys can be changed in the config ([Configuration](#conf
 | OS | Windows 10/11 x64 |
 | Elden Ring | App Ver. **1.17.1** (`eldenring.exe` **2.7.1.0**), Steam. Other builds are refused by the host DLL. |
 | ULTRAKILL | Current Steam build (Unity 2022.3). The bridge boots it straight into the sandbox, which it uses as an empty shell. |
-| Build tools | .NET 8 SDK, Python 3, git. `tools\Build.ps1` downloads LLVM-MinGW and BepInEx 5.4.23.5 itself. |
+| Build tools | .NET 8 SDK, Python 3, git. `tools\Build.ps1` downloads LLVM-MinGW and BepInEx 5.4.23.5 itself; compiling the guest needs ULTRAKILL's installed `Managed` DLLs. |
 | Hardware | Enough CPU/GPU/RAM to run both games at the same time. |
 
 You need your own copies of both games. **Offline only:** the launcher starts `eldenring.exe` directly, without
@@ -82,19 +84,20 @@ Easy Anti-Cheat, and the host DLL refuses to activate if EAC is present. Never t
 All commands run in PowerShell from the repository root.
 
 ```powershell
-git clone https://github.com/Themetralla3000/UltraRing.git
+git clone --recursive https://github.com/Themetralla3000/UltraRing.git
 cd UltraRing
-powershell -ExecutionPolicy Bypass -File tools\Build.ps1   # host DLLs, plugin, BepInEx runtime
+# cloned without --recursive?  git submodule update --init
+powershell -ExecutionPolicy Bypass -File tools\Build.ps1   # host DLLs + staged guest (bridge\dist\guest)
 powershell -ExecutionPolicy Bypass -File .\Install.ps1     # close both games first
 .\start.bat                                                # or: powershell -File .\Launch.ps1
 ```
 
 1. **Build** fetches the pinned Minecraft Ring source and the toolchains if missing, builds the Elden Ring host
-   DLLs and `UltraRing.sln`, and stages BepInEx + the plugin under `runtime\ultrakill-bepinex\`.
+   DLLs, then calls the kit's `bridge\scripts\Build.ps1` to build the ULTRAKILL guest and stage BepInEx + the plugin under `bridge\dist\guest\`. Upgrading from 0.2.0: your old plugin config is copied to the new name once.
 2. **Install** (defaults to the Steam paths; override with `-EldenRingDir` / `-UltrakillDir`):
    - Elden Ring: backs up your saves (`%APPDATA%\EldenRing`) and moves conflicting mods (Seamless Coop, ReShade,
      other `dinput8.dll` mods...) into `backups\<timestamp>`, then copies the bridge DLLs and `steam_appid.txt`.
-   - ULTRAKILL: only adds BepInEx's `winhttp.dll` with a **disabled** `doorstop_config.ini`; launching ULTRAKILL
+   - ULTRAKILL (through the kit's `Install-Guest.ps1`): only adds BepInEx's `winhttp.dll` with a **disabled** `doorstop_config.ini`; launching ULTRAKILL
      from Steam stays vanilla. The bridge enables BepInEx through command-line arguments only.
 3. **Launch**: starts Elden Ring with the bridge (switching it to borderless window mode, which the input overlay
    needs), waits for the host DLL, then starts ULTRAKILL. In Elden Ring choose **Continue**. When the Tarnished is
@@ -139,7 +142,7 @@ flowchart LR
 | Role | Game | Responsibilities |
 | --- | --- | --- |
 | Host | Elden Ring, with Minecraft Ring's native bridge DLL **unchanged** | World, enemies and saves; camera override; hidden stand-in that takes enemy hits; terrain ray queries; enemy table and damage application; interactions; D3D12 compositing with depth and relighting |
-| Guest | ULTRAKILL, with the UltraRing BepInEx plugin (this repo) | V1 and its weapons; invisible colliders rebuilt from host rays; one hittable proxy per host enemy; frame capture; the input window glued over Elden Ring |
+| Guest | ULTRAKILL, with the [ULTRAKILL Crossover Bridge](https://github.com/Themetralla3000/ultrakill-crossover-bridge) BepInEx plugin (`bridge/`) | V1 and its weapons; invisible colliders rebuilt from host rays; one hittable proxy per host enemy; frame capture; the input window glued over Elden Ring |
 
 The guest speaks the exact `bridge_protocol.h` layout of Minecraft Ring's Fabric mod, so the Elden Ring side needs
 no changes at all. Per frame the guest:
@@ -155,7 +158,7 @@ while you only see Elden Ring.
 
 ## Configuration
 
-`runtime\ultrakill-bepinex\BepInEx\config\dev.ultraring.ultrakill.cfg` (created on the first run):
+`bridge\dist\guest\BepInEx\config\dev.ukbridge.guest.cfg` (created on the first run; `Build.ps1` restages that folder, so copy the file aside if you want to keep edits across rebuilds):
 
 | Section | Key | Default | Meaning |
 | --- | --- | --- | --- |
@@ -167,7 +170,7 @@ while you only see Elden Ring.
 | Rendering | `InteractKey` / `SwitchKey` | V / F8 | Interaction and control-switch keys. |
 | Rendering | `Composite` | true | Draw V1's layers into Elden Ring's frame. |
 | Rendering | `CaptureScale` | 1 | Capture resolution factor (lower = faster, blurrier arm/HUD). |
-| Rendering | `WindowMode` | Layered | Input window technique: `Layered`, `Region` or `Tiny` (see Troubleshooting). |
+| Rendering | `WindowMode` | Layered | Input window technique: `Layered`, `Region` or `Tiny` (see Troubleshooting). The environment variable `UKBRIDGE_WINDOW_MODE` overrides it. |
 | Rendering | `CaptureFlipRows` | false | Flip the captured layers if V1's arm appears upside down. |
 | Terrain | `Radius` / `CellSize` | 24 / 0.5 | Sampling radius and resolution in metres. |
 | Terrain | `StepHeight` | 0.6 | Height jump (m) between samples that becomes a wall instead of a slope. |
@@ -180,13 +183,13 @@ while you only see Elden Ring.
 | --- | --- |
 | Elden Ring minimises or flickers when V1 takes over | Elden Ring must be in **borderless window** mode (System → Graphics → Screen Mode). The launcher sets it, but an in-game change back to Fullscreen breaks the overlay. |
 | Can't get back into the game after Alt+Tab | Click the middle of the screen, or run `Focus.bat`. |
-| ULTRAKILL is visible on top of Elden Ring | Set `WindowMode = Region` in the config. |
+| ULTRAKILL is visible on top of Elden Ring | Set `WindowMode = Region` in the config (or `UKBRIDGE_WINDOW_MODE=Region`). |
 | V1's arm/HUD is upside down | Set `CaptureFlipRows = true`. |
 | ULTRAKILL crashed and Elden Ring is frozen on its last frame / you can't move the Tarnished | Run `Stop.bat`. |
 | V1 falls through a spot or walks through a wall | Press F10 to see the rebuilt terrain there and report it with a screenshot and the logs. |
 | Launcher says the bridge did not load | Close Elden Ring, start it only through `start.bat`, check `runtime\er-bridge.log` and the exact Elden Ring version. |
 
-Logs: `runtime\er-bridge.log` (Elden Ring side) and `runtime\ultrakill-bepinex\BepInEx\LogOutput.log` (ULTRAKILL side).
+Logs: `runtime\er-bridge.log` (Elden Ring side) and `bridge\dist\guest\BepInEx\LogOutput.log` (ULTRAKILL side).
 
 ## Known limitations
 
@@ -204,11 +207,10 @@ Logs: `runtime\er-bridge.log` (Elden Ring side) and `runtime\ultrakill-bepinex\B
 
 | Path | Contents |
 | --- | --- |
-| `src/UltraRing.Link/` | C# mirror of the shared-memory protocol (`bridge.shm`, `frames.shm`), guest and host accessors |
-| `src/UltraRing.Ultrakill/` | The ULTRAKILL plugin: session, terrain, combat, capture, window overlay, interactions |
-| `tools/UltraRing.FakeHost/` | A fake host (WinForms) speaking the protocol, to develop the guest without Elden Ring: `.\Launch.ps1 -FakeHost` |
-| `tests/UltraRing.Link.Tests/` | Protocol layout checks against the C header, round-trip and terrain-cache tests: `dotnet run --project tests\UltraRing.Link.Tests` |
-| `docs/research/` | Host contract, ULTRAKILL internals, reviews, toolchain notes |
+| `bridge/` | Git submodule: [ULTRAKILL Crossover Bridge](https://github.com/Themetralla3000/ultrakill-crossover-bridge): guest plugin, protocol (C# and spec), host SDK, fake host and protocol tests. Develop the guest, add hosts or run the fake host there (`bridge\scripts\Run-FakeHost.ps1`; `.\Launch.ps1 -FakeHost` here uses it too). |
+| `tools/` | `Build.ps1` (host DLLs + the kit's build), `Stop.ps1`, `Focus.ps1`, shared helpers |
+| `Install.ps1`, `Launch.ps1`, `Restore.ps1` | Elden Ring install/launch/restore; the ULTRAKILL part delegates to the kit's `Install-Guest.ps1`, `Launch-Guest.ps1`, `Uninstall-Guest.ps1` |
+| `docs/research/` | History: host contract, ULTRAKILL internals, reviews, toolchain notes (current docs are in the kit) |
 | `external/` | Pinned Minecraft Ring checkout (`711015a`), fetched by `Build.ps1`, not committed |
 
 ## Credits
@@ -216,6 +218,7 @@ Logs: `runtime\er-bridge.log` (Elden Ring side) and `runtime\ultrakill-bepinex\B
 - [Minecraft Ring](https://github.com/siddoff/Minecraft-Ring) by **siddoff** and
   [minecraft-crossover-bridge](https://github.com/justbustin/minecraft-crossover-bridge) by **justbustin** (MIT):
   the Elden Ring host DLLs, the protocol and the overall design. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+- [ULTRAKILL Crossover Bridge](https://github.com/Themetralla3000/ultrakill-crossover-bridge) (same author, MIT): the ULTRAKILL guest, protocol and tooling.
 - [BepInEx](https://github.com/BepInEx/BepInEx) and HarmonyX for loading and patching ULTRAKILL.
 
 UltraRing is an unofficial fan project, unaffiliated with New Blood Interactive, Arsi "Hakita" Patala,

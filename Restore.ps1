@@ -103,11 +103,18 @@ if ($Install.eldenring) {
 if ($Install.ultrakill) {
     $Uk = $Install.ultrakill
     Write-Output "ULTRAKILL ($($Uk.game_dir)):"
-    $To = Join-Path $Archive 'ultrakill'
-    foreach ($Name in 'winhttp.dll', 'doorstop_config.ini') { Move-Out $Uk.game_dir $Name $To }
-    if ($Uk.created_steam_appid) { Move-Out $Uk.game_dir 'steam_appid.txt' $To }
-    foreach ($Name in @($Uk.backed_up | Where-Object { $_ })) { Put-Back $Uk.game_dir $Uk.backup $Name (Join-Path $Archive 'ultrakill-conflicts') }
-    Write-Output 'ULTRAKILL: BepInEx proxy removed, previous files restored.'
+    $KitUninstall = Join-Path $ProjectRoot 'bridge\scripts\Uninstall-Guest.ps1'
+    if ($Uk.guest_record -and (Test-Path -LiteralPath ([string]$Uk.guest_record)) -and (Test-Path -LiteralPath $KitUninstall)) {
+        # Installed through the kit (UltraRing 0.3.0+): let it undo its own install.
+        if ($WhatIfPreference) { & $KitUninstall -UltrakillDir $Uk.game_dir -WhatIf } else { & $KitUninstall -UltrakillDir $Uk.game_dir }
+    } else {
+        # UltraRing 0.2.0 record (or the kit record is gone): same steps as before.
+        $To = Join-Path $Archive 'ultrakill'
+        foreach ($Name in 'winhttp.dll', 'doorstop_config.ini') { Move-Out $Uk.game_dir $Name $To }
+        if ($Uk.created_steam_appid) { Move-Out $Uk.game_dir 'steam_appid.txt' $To }
+        foreach ($Name in @($Uk.backed_up | Where-Object { $_ })) { Put-Back $Uk.game_dir $Uk.backup $Name (Join-Path $Archive 'ultrakill-conflicts') }
+        Write-Output 'ULTRAKILL: BepInEx proxy removed, previous files restored.'
+    }
 }
 
 if ($WhatIfPreference) { Write-Output 'What if: no changes were made.'; return }

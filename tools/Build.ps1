@@ -1,17 +1,24 @@
 <#
 .SYNOPSIS
-  Builds everything UltraRing needs: the Elden Ring host DLLs, the managed solution, and a staged BepInEx runtime
-  for ULTRAKILL at runtime\ultrakill-bepinex. Touches no game folder and starts no game.
+  Builds everything UltraRing needs: the Elden Ring host DLLs (from the pinned Minecraft Ring source) and, through the
+  ULTRAKILL Crossover Bridge kit (git submodule bridge\), the staged ULTRAKILL guest at bridge\dist\guest.
+  Touches no game folder and starts no game.
 .PARAMETER Configuration
-  dotnet build configuration (default Release).
+  dotnet build configuration for the guest (default Release).
+.PARAMETER UltrakillDir
+  The folder containing ULTRAKILL.exe (its Managed DLLs are needed to compile the guest).
 .PARAMETER SkipNative
-  Do not (re)build the host DLLs.
+  Do not (re)build the Elden Ring host DLLs.
+.PARAMETER SkipGuest
+  Do not build/stage the ULTRAKILL guest.
 .PARAMETER SkipManaged
-  Do not run dotnet build (only stage what is already built).
+  Guest: do not run dotnet build, only stage what is already built (bridge\scripts\Build.ps1 -SkipBuild).
 #>
 param(
     [string]$Configuration = 'Release',
+    [string]$UltrakillDir = 'C:\Program Files (x86)\Steam\steamapps\common\ULTRAKILL',
     [switch]$SkipNative,
+    [switch]$SkipGuest,
     [switch]$SkipManaged
 )
 
@@ -27,10 +34,6 @@ $LlvmTag = '20261006'
 $LlvmName = "llvm-mingw-$LlvmTag-ucrt-x86_64"
 $LlvmUrl = "https://github.com/mstorsjo/llvm-mingw/releases/download/$LlvmTag/$LlvmName.zip"
 $LlvmSha = '317492c456aa27ee607a5919f1d2d38dcdc1112516a24d0bf4b00d078f52d17a'
-$BepVersion = '5.4.23.5'
-$BepName = "BepInEx_win_x64_$BepVersion"
-$BepUrl = "https://github.com/BepInEx/BepInEx/releases/download/v$BepVersion/$BepName.zip"
-$BepSha = '82f9878551030f54657792c0740d9d51a09500eeae1fba21106b0c441e6732c4'
 
 function Step([string]$Text) { Write-Host "==> $Text" -ForegroundColor Cyan }
 
@@ -106,57 +109,32 @@ if (-not $SkipNative) {
     }
 }
 
-# ---------------------------------------------------------------- 4. BepInEx
-Step "BepInEx $BepVersion"
-$BepDir = Join-Path $Tools 'bepinex5-x64'
-if (-not (Test-Path -LiteralPath (Join-Path $BepDir 'BepInEx\core\BepInEx.Preloader.dll'))) {
-    $Zip = Join-Path $Tools "downloads\bepinex5\$BepName.zip"
-    Get-Download $BepUrl $BepSha $Zip
-    New-Item -ItemType Directory -Path $BepDir -Force | Out-Null
-    Write-Host '    extracting'
-    Expand-Archive -LiteralPath $Zip -DestinationPath $BepDir -Force
-    if (-not (Test-Path -LiteralPath (Join-Path $BepDir 'BepInEx\core\BepInEx.Preloader.dll'))) { throw "BepInEx.Preloader.dll not found after extracting $Zip." }
-}
+# ---------------------------------------------------------------- 4. ULTRAKILL guest (the kit)
+$Kit = Join-Path $Root 'bridge'
+$KitBuild = Join-Path $Kit 'scripts\Build.ps1'
+$GuestStage = Join-Path $Kit 'dist\guest'
+if (-not $SkipGuest) {
+    if (-not (Test-Path -LiteralPath $KitBuild)) {
+        throw 'The ULTRAKILL Crossover Bridge submodule (bridge\) is not initialised. Run: git submodule update --init'
+    }
+    Step 'ULTRAKILL guest (bridge\scripts\Build.ps1)'
+    $KitArgs = @{ Configuration = $Configuration; UltrakillDir = $UltrakillDir }
+    if ($SkipManaged) { $KitArgs.SkipBuild = $true }
+    & $KitBuild @KitArgs
 
-# ---------------------------------------------------------------- 5. managed build
-if (-not $SkipManaged) {
-    Step "dotnet build UltraRing.sln -c $Configuration"
-    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) { throw 'The .NET SDK (dotnet) was not found in PATH.' }
-    & dotnet build (Join-Path $Root 'UltraRing.sln') -c $Configuration --nologo -v:minimal
-    if ($LASTEXITCODE -ne 0) { throw 'dotnet build failed.' }
-}
-
-# ---------------------------------------------------------------- 6. stage the ULTRAKILL BepInEx runtime
-Step 'Staging runtime\ultrakill-bepinex'
-$Stage = Join-Path $Root 'runtime\ultrakill-bepinex'
-$Out = Join-Path $Root "src\UltraRing.Ultrakill\bin\$Configuration\netstandard2.1"
-foreach ($Name in 'UltraRing.Ultrakill.dll', 'UltraRing.Link.dll') {
-    if (-not (Test-Path -LiteralPath (Join-Path $Out $Name))) { throw "Missing $Out\$Name (build the solution first)." }
-}
-$StageCore = Join-Path $Stage 'BepInEx\core'
-$StagePlugin = Join-Path $Stage 'BepInEx\plugins\UltraRing'
-New-Item -ItemType Directory -Path $StageCore, $StagePlugin, (Join-Path $Stage 'BepInEx\config') -Force | Out-Null
-Copy-Item -Path (Join-Path $BepDir 'BepInEx\core\*') -Destination $StageCore -Recurse -Force
-Copy-Item -LiteralPath (Join-Path $BepDir 'winhttp.dll') -Destination (Join-Path $Stage 'winhttp.dll') -Force
-foreach ($Name in 'UltraRing.Ultrakill.dll', 'UltraRing.Link.dll') {
-    Copy-Item -LiteralPath (Join-Path $Out $Name) -Destination (Join-Path $StagePlugin $Name) -Force
-}
-$Pdb = Join-Path $Out 'UltraRing.Ultrakill.pdb'
-if (Test-Path -LiteralPath $Pdb) { Copy-Item -LiteralPath $Pdb -Destination $StagePlugin -Force }
-
-# ULTRAKILL modding convention: hide the BepInEx manager object, otherwise objects created by plugins before the
-# first scene do not survive it.
-$BepCfg = Join-Path $Stage 'BepInEx\config\BepInEx.cfg'
-if (Test-Path -LiteralPath $BepCfg) {
-    $Text = [IO.File]::ReadAllText($BepCfg) -replace 'HideManagerGameObject = false', 'HideManagerGameObject = true'
-    [IO.File]::WriteAllText($BepCfg, $Text)
-} else {
-    [IO.File]::WriteAllText($BepCfg, "[Chainloader]`r`n`r`nHideManagerGameObject = true`r`n")
+    # One-time migration of the v0.2.0 plugin config (renamed with the split into the kit).
+    $OldCfg = Join-Path $Root 'runtime\ultrakill-bepinex\BepInEx\config\dev.ultraring.ultrakill.cfg'
+    $NewCfg = Join-Path $GuestStage 'BepInEx\config\dev.ukbridge.guest.cfg'
+    if ((Test-Path -LiteralPath $OldCfg) -and -not (Test-Path -LiteralPath $NewCfg)) {
+        New-Item -ItemType Directory -Path (Split-Path -Parent $NewCfg) -Force | Out-Null
+        Copy-Item -LiteralPath $OldCfg -Destination $NewCfg
+        Write-Host "    migrated your old plugin config to $NewCfg" -ForegroundColor Yellow
+        Write-Host '    (runtime\ultrakill-bepinex is no longer used; delete it once you have checked the new config)' -ForegroundColor Yellow
+    }
 }
 
 Write-Host ''
 Write-Host 'Build finished.' -ForegroundColor Green
-Write-Host "  host DLLs : $McDir\dist"
-Write-Host "  BepInEx   : $Stage"
-Write-Host "  plugin    : $StagePlugin"
+Write-Host "  host DLLs    : $McDir\dist"
+Write-Host "  staged guest : $GuestStage"
 Write-Host 'Next: .\Install.ps1, then .\Launch.ps1 (or .\Launch.ps1 -FakeHost to test without Elden Ring).'
