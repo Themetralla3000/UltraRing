@@ -1,3 +1,5 @@
+using System;
+using System.Collections.Generic;
 using System.Text;
 using UltraRing.Link;
 using UltraRing.Ultrakill.Combat;
@@ -62,6 +64,13 @@ namespace UltraRing.Ultrakill
         private Vector3 _prePin;
         private bool _prePinSet;
         private bool _showDebug;
+        private float _pendingDamage;
+        private long _mapCreatedMs = long.MinValue;
+        private readonly HashSet<string> _logged = new HashSet<string>();
+        /// <summary>Re-anchor the map when V1 is this far (units) from the Unity origin (float precision).</summary>
+        private const float RebaseUnits = 5000f;
+        /// <summary>Hostile-entity table may still hold the old zone for a moment after the zone changed.</summary>
+        private const long ZoneSettleMs = 300;
 
         public void Init(GuestLink link)
         {
@@ -77,6 +86,12 @@ namespace UltraRing.Ultrakill
             _interaction = new HostInteraction();
             _showDebug = BridgeConfig.DebugOverlay.Value;
             SceneManager.sceneLoaded += OnSceneLoaded;
+            AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+        }
+
+        private void OnProcessExit(object sender, EventArgs e)
+        {
+            try { ReleaseControl(); } catch { }
         }
 
         /// <summary>Entry for the scene that was loading when the session was created.</summary>
@@ -95,6 +110,7 @@ namespace UltraRing.Ultrakill
             _enemies.Clear();
             _capture.Teardown();
             Map = null;
+            _pendingDamage = 0f;
             _recallPending = true;
             _everRecalled = false;
             _prePinSet = false;
@@ -115,53 +131,101 @@ namespace UltraRing.Ultrakill
 
         private void LateUpdate()
         {
+            try { LateUpdateCore(); }
+            catch (Exception e)
+            {
+                // Whatever failed, the host must not keep COMPOSITE / MOVE_HUNTER from the last good frame.
+                LogOnce("frame", "Bridge frame failed; releasing control: " + e);
+                try { ReleaseControl(); _capture.Cancel(); } catch { }
+            }
+        }
+
+        private void LogOnce(string key, string message)
+        {
+            if (_logged.Add(key)) Plugin.Log.LogError(message);
+        }
+
+        /// <summary>Runs one subsystem; a failure is logged once and does not stop the rest of the frame.</summary>
+        private void Guard(string what, Action a)
+        {
+            try { a(); }
+            catch (Exception e) { LogOnce(what, what + " failed (further errors suppressed): " + e); }
+        }
+
+        private void LateUpdateCore()
+        {
             _alive = Link.Poll();
             Link.BumpGuestHeartbeat();
+            if (!_alive)
+            {
+                // A restarted host may restart its counters from a lower value: baseline again on re-attach.
+                _countersInit = false;
+                _hunterInit = false;
+            }
             bool haveState = _alive && Link.Snapshot(out _state);
             _overlay.Tick(Link, _state, _alive && haveState && InBridgeScene, HostMode, !Driving);
+            if (_alive && haveState && !_clearedStaleControl)
+            {
+                // A previous guest may have died with COMPOSITE set; the host compositor has no timeout. Done on the
+                // first successful poll, whatever scene is loaded.
+                _clearedStaleControl = true;
+                _controlReleased = false;
+                ReleaseControl();
+            }
             if (!InBridgeScene) return;
 
+            var nm = V1.Movement;
             if (!_alive || !haveState)
             {
                 if (Driving) Plugin.Log.LogInfo("Host lost; releasing control.");
                 ReleaseControl();
                 if (_hostGoneSinceMs == long.MinValue) _hostGoneSinceMs = Link.NowMs;
-                else if (Link.NowMs - _hostGoneSinceMs > 2000) _capture.ReleaseRig();
+                else if (Link.NowMs - _hostGoneSinceMs > 2000)
+                {
+                    _capture.ReleaseRig();
+                    if (HostMode) ExitHostMode();
+                }
+                Guard("pin", () => PinUntilFirstRecall(nm)); // no host: do not free-fall through the removed floors
                 return;
             }
             _hostGoneSinceMs = long.MinValue;
-            if (!_clearedStaleControl)
-            {
-                // A previous guest may have died with COMPOSITE set; the host compositor has no timeout.
-                _clearedStaleControl = true;
-                _controlReleased = false;
-                ReleaseControl();
-            }
 
-            ReadCounters();
-            UpdateAnchor();
-            ApplyHostDamage();
+            Guard("counters", ReadCounters);
+            Guard("anchor", UpdateAnchor);
+            Guard("host damage", () => { ApplyHostDamage(); DrainHostDamage(); });
             TrackOwnDeath();
 
-            var nm = V1.Movement;
+            nm = V1.Movement;
             bool hostAlive = Has(Protocol.StatePlayerValid) && !Has(Protocol.StateHostBusy) && !Has(Protocol.StatePlayerDead);
 
-            if (_recallPending && hostAlive && Map != null && nm != null && (nm.activated || nm.dead)) DoRecall();
-            PinUntilFirstRecall(nm);
+            if (_recallPending && hostAlive && Map != null && nm != null && (nm.activated || nm.dead))
+            {
+                try { DoRecall(); }
+                catch (Exception e)
+                {
+                    // Do not retry (and throw) every frame; the next host life change recalls again.
+                    _recallPending = false;
+                    _recallAtMs = Link.NowMs;
+                    _everRecalled = true;
+                    LogOnce("recall", "Recall failed: " + e);
+                }
+            }
+            Guard("pin", () => PinUntilFirstRecall(nm));
+            Guard("rebase", () => RebaseIfFar(nm));
 
             if (Map != null && hostAlive && nm != null && !_recallPending)
             {
-                _terrain.Tick(Link, Map, V1.Feet(nm), nm.rb.velocity);
-                _enemies.Tick(Link, Map);
-                HoldForGround(nm);
+                Guard("terrain", () => _terrain.Tick(Link, Map, V1.Feet(nm), nm.rb.velocity));
+                if (Link.NowMs - _mapCreatedMs >= ZoneSettleMs) Guard("enemies", () => _enemies.Tick(Link, Map));
+                Guard("ground hold", () => HoldForGround(nm));
             }
 
             bool ready = hostAlive && Map != null && Map.Zone == _state.stageId && !_recallPending
                          && Link.NowMs - _recallAtMs >= RecallSettleMs && !_holdingForGround && !HostMode && V1.Ready;
             if (ready) Drive(nm);
             else ReleaseControl();
-            _interaction.Tick(Link, Driving, _terrain, Map, nm != null ? V1.Feet(nm) : Vector3.zero);
-            _capture.Tick(Link);
+            Guard("interaction", () => _interaction.Tick(Link, Driving, _terrain, Map, nm != null ? V1.Feet(nm) : Vector3.zero));
+            Guard("capture", () => _capture.Tick(Link));
         }
 
         private bool Has(uint flag) => (_state.flags & flag) != 0;
@@ -190,13 +254,14 @@ namespace UltraRing.Ultrakill
             }
             if (deaths != _lastHostDeaths)
             {
+                bool increased = deaths > _lastHostDeaths; // a lower value is a restarted counter, not a death
                 _lastHostDeaths = deaths;
                 var nm = V1.Movement;
-                if (nm != null && !nm.dead)
+                if (increased && nm != null && !nm.dead)
                 {
                     Plugin.Log.LogInfo("The stand-in died in the host game; V1 dies too.");
-                    _deathFromHost = true;
                     nm.GetHurt(99999, false, 0f, ignoreInvincibility: true);
+                    _deathFromHost = nm.dead; // GetHurt is a no-op after the level ended or with the invincibility cheat
                 }
             }
             if (sw != _lastSwitchReq)
@@ -218,7 +283,27 @@ namespace UltraRing.Ultrakill
                 fixed (float* p = _state.playerPos)
                     Map = new CoordMap(zone, p[0], p[1], p[2], BridgeConfig.MetresPerUnit.Value);
             }
+            _mapCreatedMs = Link.NowMs;
+            _pendingDamage = 0f;
             Plugin.Log.LogInfo($"Zone {zone:X8}: anchored at host ({Map.AnchorX:F1}, {Map.AnchorY:F1}, {Map.AnchorZ:F1}).");
+            ReleaseControl();
+            _terrain.Reset();
+            _enemies.Clear();
+            _recallPending = true;
+        }
+
+        /// <summary>
+        /// Single-precision physics and meshes jitter far from the origin (open-world zones are km across): move the
+        /// anchor to V1 and recall. Terrain is host-metre based, so only the colliders are rebuilt.
+        /// </summary>
+        private void RebaseIfFar(NewMovement nm)
+        {
+            if (Map == null || nm == null || _recallPending || HostMode) return;
+            if (nm.transform.position.sqrMagnitude < RebaseUnits * RebaseUnits) return;
+            Vector3 host = Map.ToHost(V1.Feet(nm));
+            Map = new CoordMap(Map.Zone, host.x, host.y, host.z, Map.MetresPerUnit);
+            Plugin.Log.LogInfo($"Zone {Map.Zone:X8}: re-anchored at host ({host.x:F1}, {host.y:F1}, {host.z:F1}), V1 was far from the origin.");
+            _mapCreatedMs = Link.NowMs;
             ReleaseControl();
             _terrain.Reset();
             _enemies.Clear();
@@ -310,8 +395,23 @@ namespace UltraRing.Ultrakill
             if (nm == null || nm.dead || !Driving || hostDamage <= 0f) return;
             if (Combat.ParrySystem.TryParry(ev, hostDamage)) return; // punched just in time: parried, no damage
             float share = hostDamage / Mathf.Max(ev.hunterMaxHp, 1f);
-            int damage = Mathf.Max(1, Mathf.RoundToInt(share * 100f * BridgeConfig.HostDamageScale.Value));
-            // invincible: true gives V1 its normal i-frames; a dash (layer 15) dodges the hit like in ULTRAKILL.
+            _pendingDamage = Mathf.Min(_pendingDamage + share * 100f * BridgeConfig.HostDamageScale.Value, 100f);
+        }
+
+        /// <summary>
+        /// Applies accumulated host damage. Hits inside V1's hurt invincibility are kept and land when it ends instead of
+        /// being lost; a dash (layer 15 without hurt invincibility) still dodges them like in ULTRAKILL.
+        /// </summary>
+        private void DrainHostDamage()
+        {
+            var nm = V1.Movement;
+            if (_pendingDamage <= 0f) return;
+            if (nm == null || nm.dead || !Driving) { _pendingDamage = 0f; return; }
+            if (nm.hurtInvincibility > 0f) return; // wait for the i-frames to run out
+            if (nm.gameObject.layer == 15) { _pendingDamage = 0f; return; } // dashing: dodged
+            int damage = Mathf.FloorToInt(_pendingDamage);
+            if (damage < 1) return; // chip damage accumulates
+            _pendingDamage -= damage;
             nm.GetHurt(damage, true);
         }
 
@@ -401,6 +501,7 @@ namespace UltraRing.Ultrakill
         private void OnDestroy()
         {
             SceneManager.sceneLoaded -= OnSceneLoaded;
+            AppDomain.CurrentDomain.ProcessExit -= OnProcessExit;
             Shutdown();
         }
 

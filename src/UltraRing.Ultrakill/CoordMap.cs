@@ -21,7 +21,7 @@ namespace UltraRing.Ultrakill
             AnchorX = ax;
             AnchorY = ay;
             AnchorZ = az;
-            MetresPerUnit = metresPerUnit;
+            MetresPerUnit = float.IsNaN(metresPerUnit) || metresPerUnit < 0.001f ? 0.5f : metresPerUnit;
         }
 
         public Vector3 ToUk(double x, double y, double z)

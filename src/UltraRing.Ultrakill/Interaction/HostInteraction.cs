@@ -28,6 +28,9 @@ namespace UltraRing.Ultrakill.Interaction
         private Text _label;
         private string _shown;
         private int _performed;
+        private uint _timedOutReq;
+        private string _promptCacheSrc, _promptCacheText = "";
+        private KeyCode _promptCacheKey;
 
         public string Status => $"prompt '{_prompt}', {_performed} actions{(_pending ? ", waiting for the host" : "")}";
 
@@ -42,6 +45,7 @@ namespace UltraRing.Ultrakill.Interaction
 
             if (driving && !_pending && Input.GetKeyDown(BridgeConfig.InteractKey.Value))
             {
+                _timedOutReq = 0;
                 _pendingReq = link.RequestAction();
                 _pending = _pendingReq != 0;
                 _pendingAtMs = now;
@@ -56,8 +60,15 @@ namespace UltraRing.Ultrakill.Interaction
                 else if (now - _pendingAtMs > AckTimeoutMs)
                 {
                     _pending = false;
+                    _timedOutReq = _pendingReq;
                     Flash("The host did not answer", now);
                 }
+            }
+            else if (_timedOutReq != 0 && link.ActionAck == _timedOutReq)
+            {
+                // The ack arrived after the timeout: the action happened, so the collision still has to be resampled.
+                _timedOutReq = 0;
+                if (link.ActionResult == 1) HandleResult(1, now);
             }
 
             if (_resampleAtMs != long.MinValue && now >= _resampleAtMs && map != null)
@@ -100,12 +111,24 @@ namespace UltraRing.Ultrakill.Interaction
         private void UpdateLabel(long now)
         {
             string text = now < _flashUntilMs ? _flash
-                : string.IsNullOrEmpty(_prompt) ? "" : $"[{BridgeConfig.InteractKey.Value}]  {_prompt}";
+                : string.IsNullOrEmpty(_prompt) ? "" : PromptText();
             if (text == _shown && _label != null) return;
             if (!EnsureLabel()) return;
             _shown = text;
             _label.text = text;
             _label.enabled = text.Length > 0;
+        }
+
+        private string PromptText()
+        {
+            var key = BridgeConfig.InteractKey.Value;
+            if (_prompt != _promptCacheSrc || key != _promptCacheKey || _promptCacheText.Length == 0)
+            {
+                _promptCacheSrc = _prompt;
+                _promptCacheKey = key;
+                _promptCacheText = $"[{key}]  {_prompt}";
+            }
+            return _promptCacheText;
         }
 
         private bool EnsureLabel()

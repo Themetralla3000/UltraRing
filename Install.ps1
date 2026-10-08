@@ -37,6 +37,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = $PSScriptRoot
+. (Join-Path $PSScriptRoot 'tools\BridgeCommon.ps1')
 $RecordPath = Join-Path $ProjectRoot 'installation.json'
 
 function Resolve-Dir([string]$Path) { [IO.Path]::GetFullPath($Path).TrimEnd('\') }
@@ -92,12 +93,20 @@ if (-not $SkipEldenRing) {
         $ErBackup = [string]$PrevEr.backup
         $Moved = @($PrevEr.moved_mods)
         $HadAppId = [bool]$PrevEr.had_steam_appid
+        $OrigScreenMode = [string]$PrevEr.original_screen_mode
         Write-Output 'Elden Ring: already installed here, refreshing the bridge files.'
     } else {
         $ErBackup = Join-Path $BackupRoot 'eldenring'
         New-Item -ItemType Directory -Path $ErBackup -Force | Out-Null
         $SaveRoot = Join-Path $env:APPDATA 'EldenRing'
-        if (Test-Path -LiteralPath $SaveRoot) { Copy-Item -LiteralPath $SaveRoot -Destination "$ErBackup\saves" -Recurse }
+        # Saves + GraphicsConfig.xml are copied FIRST, before any file is moved and before Launch.ps1 ever edits ScreenMode.
+        $OrigScreenMode = $null
+        if (Test-Path -LiteralPath $SaveRoot) {
+            Copy-Item -LiteralPath $SaveRoot -Destination "$ErBackup\saves" -Recurse
+            if (-not (Test-Path -LiteralPath "$ErBackup\saves")) { throw "The save backup failed ($ErBackup\saves); nothing was changed." }
+            try { $OrigScreenMode = Get-ScreenMode "$ErBackup\saves\GraphicsConfig.xml" } catch { $OrigScreenMode = $null }
+            Write-Output "Elden Ring: saves backed up to $ErBackup\saves (original ScreenMode: $(if ($OrigScreenMode) { $OrigScreenMode } else { 'unknown' }))."
+        }
         $ModNames = @('dinput8.dll', 'dxgi.dll', 'd3d11.dll', 'winmm.dll', 'version.dll', 'modengine2.dll', 'modengine2', 'mods', 'mod', 'SeamlessCoop', 'ersc_launcher.exe', 'ersc.dll', 'ersc_settings.ini', 'mod_loader_config.ini', 'ReShade.ini', 'ReShadePreset.ini', 'reshade-shaders', 'erbridge')
         $Moved = @()
         foreach ($Name in $ModNames) {
@@ -120,10 +129,13 @@ if (-not $SkipEldenRing) {
         game_dir = $EldenRingDir
         backup = $ErBackup
         moved_mods = $Moved
+        original_screen_mode = $OrigScreenMode
         had_steam_appid = $HadAppId
         native_sha256 = (Get-FileHash -LiteralPath "$EldenRingDir\erbridge\erbridge_core.dll").Hash
     }
     Write-Output "Elden Ring: installed. Previous mod files moved: $($Moved.Count) (backup: $ErBackup)."
+    foreach ($Name in $Moved) { Write-Output "  moved out of the game folder: $Name (Restore.ps1 puts it back)" }
+    Write-Output 'Note: Launch.ps1 switches Elden Ring from FULLSCREEN to BORDERLESS in GraphicsConfig.xml (needed so it does not minimise when ULTRAKILL takes focus). Restore.ps1 offers to undo that.'
 }
 
 # ---------------------------------------------------------------- ULTRAKILL (guest)

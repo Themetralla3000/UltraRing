@@ -155,7 +155,6 @@ namespace UltraRing.Ultrakill.Terrain
         private float _statusAt = -10f;
         private string _status = "no data yet";
         private bool _tagWarned;
-        private long _totalBatches;
         private int _raysInWindow, _wallRaysInWindow;
         private float _rayRate, _wallRayRate;
         private bool _debugApplied;
@@ -181,6 +180,8 @@ namespace UltraRing.Ultrakill.Terrain
         public void Reset()
         {
             Flush();
+            // A new TerrainCache lists the zone directory once; the old instance's queued saves must be on disk by then.
+            if (_tc != null) TerrainCacheWorker.WaitIdle(500);
             _tc = null;
             _fromCache.Clear();
             _cachedLeft = 0;
@@ -277,6 +278,14 @@ namespace UltraRing.Ultrakill.Terrain
                         _stallLogged = false;
                         _batchRef = _groundRef;
                         _nextScan = 0f;
+                    }
+                    else
+                    {
+                        // Not sent (host gone between Poll and here): the walls BuildBatch marked pending must be cast again.
+                        _inflightCount = count;
+                        AbandonBatch();
+                        _inflightCount = 0;
+                        _nextScan = now + 0.1f;
                     }
                 }
                 else _nextScan = now + IdleScanInterval;
@@ -902,7 +911,6 @@ namespace UltraRing.Ultrakill.Terrain
             _raysInWindow += _inflightCount;
             _wallRaysInWindow += wallRays;
             _inflight = false;
-            _totalBatches++;
             _lastSeq = _seq;
             _batchesInWindow++;
             _nextScan = 0f;

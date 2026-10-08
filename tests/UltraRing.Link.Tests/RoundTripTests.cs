@@ -249,10 +249,6 @@ public static unsafe class RoundTripTests
         Expect(guest.HostPrompt == "", "prompt cleared");
         host.SetPrompt("Abrir la puerta éé");
         Expect(guest.HostPrompt == "Abrir la puerta éé", "prompt utf-8");
-
-        // Environment / collision writes still work on the guest side (smoke).
-        guest.WriteCollision(1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-        guest.WriteEnvironment(0, 0, 0, 0, 0);
     }
 
     private static IntPtr guestRays(GuestLink g)

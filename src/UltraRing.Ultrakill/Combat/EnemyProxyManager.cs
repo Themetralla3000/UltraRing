@@ -26,7 +26,10 @@ namespace UltraRing.Ultrakill.Combat
 
         private int _tick;
         private int _entityCount;
-        private int _hostileCount;
+        private readonly Dictionary<ulong, float> _createRetryAt = new Dictionary<ulong, float>();
+        /// <summary>Proxies are only made this close (host metres) to V1, and dropped beyond the larger radius.</summary>
+        private const float SpawnRadiusM = 80f, DropRadiusM = 100f;
+        private const float CreateRetryS = 5f;
         private int _hitsSent;
         private float _lastAmount;
         private string _lastName = "";
@@ -39,7 +42,7 @@ namespace UltraRing.Ultrakill.Combat
         public EnemyProxyManager(Transform parent) => _parent = parent;
 
         /// <summary>
-        /// Nearest living proxy whose box centre lies within <paramref name="maxUk"/> ULTRAKILL units of
+        /// Nearest living proxy whose box surface lies within <paramref name="maxUk"/> ULTRAKILL units of
         /// <paramref name="ukPos"/>; null when none. No allocation.
         /// </summary>
         public EnemyProxy Nearest(Vector3 ukPos, float maxUk)
@@ -50,7 +53,9 @@ namespace UltraRing.Ultrakill.Combat
             {
                 var p = _list[i];
                 if (p == null || !p.IsAlive || p.HostDead) continue;
-                float sq = (p.CenterWorld - ukPos).sqrMagnitude;
+                // Measure to the box surface: the host reports an attacker's feet, the centre can be metres above them.
+                Vector3 near = p.RootCol != null && p.RootCol.enabled ? p.RootCol.ClosestPoint(ukPos) : p.CenterWorld;
+                float sq = (near - ukPos).sqrMagnitude;
                 if (sq <= bestSq) { bestSq = sq; best = p; }
             }
             return best;
@@ -72,10 +77,12 @@ namespace UltraRing.Ultrakill.Combat
             if (link.ReadEntities(_ents))
             {
                 _entityCount = _ents.Count;
-                _hostileCount = 0;
+                var nm = V1.Movement;
+                bool haveV1 = nm != null;
+                Vector3 v1 = haveV1 ? V1.Feet(nm) : Vector3.zero;
                 for (int i = 0; i < _ents.Count; i++)
                 {
-                    try { ApplyEntity(_ents[i], map, now, hpPerUk); }
+                    try { ApplyEntity(link, _ents[i], map, now, hpPerUk, haveV1, v1); }
                     catch (Exception e) { LogCreateFailure(e); }
                 }
                 RemoveStale(link, map, now);
@@ -86,20 +93,19 @@ namespace UltraRing.Ultrakill.Combat
 
         public void Clear()
         {
-            for (int i = _list.Count - 1; i >= 0; i--) Destroy(_list[i], null, null);
+            for (int i = _list.Count - 1; i >= 0; i--) Destroy(_list[i]);
             _list.Clear();
             _byId.Clear();
             _entityCount = 0;
-            _hostileCount = 0;
+            _createRetryAt.Clear();
             if (Active == this) Active = null;
         }
 
         // ---- per entity ---------------------------------------------------------------------
 
-        private unsafe void ApplyEntity(ErmcEntity e, CoordMap map, float now, float hpPerUk)
+        private unsafe void ApplyEntity(GuestLink link, ErmcEntity e, CoordMap map, float now, float hpPerUk, bool haveV1, Vector3 v1)
         {
             if (e.kind != Protocol.EntLargeMonster && e.kind != Protocol.EntSmallMonster) return;
-            _hostileCount++;
             float maxHp = e.maxHp;
             if (!(maxHp > 0f) || float.IsInfinity(maxHp) || float.IsNaN(e.hp)) return;
             bool dead = (e.flags & Protocol.EntityDead) != 0 || e.hp <= 0f;
@@ -115,16 +121,32 @@ namespace UltraRing.Ultrakill.Combat
             if (p != null && p.LocalDead && !dead && now - p.DeadSince > ReviveAfter)
             {
                 // killed here but the host enemy lives on (invincible, rounding...): rebuild it
-                Destroy(p, null, null);
+                Flush(p, link, map);
+                Destroy(p);
                 _byId.Remove(e.id);
                 _list.Remove(p);
                 p = null;
             }
+            if (haveV1 && !dead)
+            {
+                // No distance cut for what is already alive until DropRadiusM (hysteresis); a proxy that is not
+                // stamped this tick is flushed and removed by RemoveStale.
+                Vector3 c = map.ToUk(e.boxCenter[0], e.boxCenter[1], e.boxCenter[2]);
+                float limit = map.ToUkLength(p != null ? DropRadiusM : SpawnRadiusM);
+                if ((c - v1).sqrMagnitude > limit * limit) return;
+            }
             if (p == null)
             {
                 if (dead) return;
+                if (_createRetryAt.TryGetValue(e.id, out float retryAt) && now < retryAt) return;
                 p = Create(e, map);
-                if (p == null) return;
+                if (p == null)
+                {
+                    if (_createRetryAt.Count > 1024) _createRetryAt.Clear();
+                    _createRetryAt[e.id] = now + CreateRetryS; // do not throw and allocate every frame
+                    return;
+                }
+                _createRetryAt.Remove(e.id);
             }
 
             if (!p.LocalDead && p.Eid.dead) p.OnLocalDeath(); // killed by something other than DeliverDamage (cheats)
@@ -263,9 +285,10 @@ namespace UltraRing.Ultrakill.Combat
                     if (p.LocalDead && now - p.DeadSince < DeathLinger) continue;
                     Flush(p, link, map);
                 }
-                if (p != null) _byId.Remove(p.HostId);
+                // p may be a destroyed (Unity-null) proxy: its managed HostId is still readable.
+                if (!ReferenceEquals(p, null)) _byId.Remove(p.HostId);
                 _list.RemoveAt(i);
-                Destroy(p, null, null);
+                Destroy(p);
             }
         }
 
@@ -295,12 +318,11 @@ namespace UltraRing.Ultrakill.Combat
 
         // ---- helpers ------------------------------------------------------------------------
 
-        private void Destroy(EnemyProxy p, GuestLink link, CoordMap map)
+        private void Destroy(EnemyProxy p)
         {
             if (p == null) return;
             try
             {
-                if (link != null && map != null) Flush(p, link, map);
                 if (p.Eid != null)
                 {
                     var tracker = MonoSingleton<EnemyTracker>.Instance;
@@ -326,7 +348,7 @@ namespace UltraRing.Ultrakill.Combat
             if (_goreZone != null)
             {
                 // proxies parented to the stale zone go with it
-                for (int i = _list.Count - 1; i >= 0; i--) Destroy(_list[i], null, null);
+                for (int i = _list.Count - 1; i >= 0; i--) Destroy(_list[i]);
                 _list.Clear();
                 _byId.Clear();
                 UnityEngine.Object.Destroy(_goreZone.gameObject);

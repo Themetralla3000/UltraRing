@@ -204,10 +204,22 @@ namespace UltraRing.Ultrakill.Render
             bool rescan = hc != _lastHud || _frame++ % HudRescanFrames == 0;
             if (!rescan || hc == null) return;
             _lastHud = hc;
+            PruneMovedLayers();
             foreach (Canvas c in hc.GetComponentsInChildren<Canvas>(true))
             {
                 if (c.isRootCanvas) MoveTree(c.transform);
             }
+        }
+
+        private readonly List<Transform> _deadKeys = new List<Transform>();
+
+        /// <summary>HUD items are created and destroyed all the time; forget the destroyed ones.</summary>
+        private void PruneMovedLayers()
+        {
+            _deadKeys.Clear();
+            foreach (KeyValuePair<Transform, int> kv in _movedLayers)
+                if (kv.Key == null) _deadKeys.Add(kv.Key);
+            for (int i = 0; i < _deadKeys.Count; i++) _movedLayers.Remove(_deadKeys[i]);
         }
 
         private void MoveTree(Transform t)

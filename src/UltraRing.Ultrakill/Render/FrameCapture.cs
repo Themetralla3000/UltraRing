@@ -55,6 +55,10 @@ namespace UltraRing.Ultrakill.Render
         private const long PendingTimeoutMs = 2000;     // a readback that takes longer counts as an error
         private const long KeepAliveMs = 300;          // re-publish the last control at least this often (host needs < 1 s)
         private const int MaxConsecutiveErrors = 8;
+        private const long RetryBackoffMs = 5000;       // after a failure capture is retried this much later
+        private const long RepeatFailureMs = 10000;     // a failure this soon after a retry is a hard latch
+        private const long ReclaimMs = 10000;           // a cancelled job whose callbacks never fire is replaced after this
+        private const long CompositeStaleMs = 250;      // keepalive drops COMPOSITE when the landed frame is older than this
         private const int PoolSize = MaxInFlight + 2;
 
         private sealed class Job
@@ -63,6 +67,7 @@ namespace UltraRing.Ultrakill.Render
             public readonly Action<AsyncGPUReadbackRequest>[] Callbacks = new Action<AsyncGPUReadbackRequest>[3];
             public int Remaining;
             public bool Error, Cancelled, InUse;
+            public long CancelledMs;
             public int W, H;
             public ErmcControl Ctrl;
             public float Near, Far, Fov;
@@ -76,15 +81,16 @@ namespace UltraRing.Ultrakill.Render
         private bool _async;
         private Texture2D _syncTex;
 
-        private bool _disabled;
+        private bool _disabled, _hardDisabled;
         private string _disabledWhy;
+        private long _retryAtMs, _lastRetryMs = long.MinValue, _nowMs;
         private int _errors;
 
         private ulong _lastHostFrame;
         private bool _haveHostFrame;
         private ErmcControl _lastControl;
         private bool _haveLast;
-        private long _lastControlMs, _lastSubmitMs;
+        private long _lastControlMs, _lastSubmitMs, _lastLandMs;
 
         private int _wantW, _wantH;
         private long _wantSince;
@@ -101,7 +107,7 @@ namespace UltraRing.Ultrakill.Render
         {
             get
             {
-                if (_disabled) return "disabled: " + _disabledWhy;
+                if (_disabled) return (_hardDisabled ? "disabled: " : "backing off: ") + _disabledWhy;
                 if (_rig == null) return "idle" + (CaptureRig.LastBuildProblem != null ? " (" + CaptureRig.LastBuildProblem + ")" : "");
                 return $"{_rig.Width}x{_rig.Height}, {_fps:F0} fps captured, {_queue.Count} in flight, last frame id {_lastFrameId}, " +
                        $"readback {_readbackMs:F1} ms, slot write {_writeMs:F1} ms{(_async ? "" : " (sync)")}";
@@ -115,11 +121,19 @@ namespace UltraRing.Ultrakill.Render
         /// </summary>
         public bool Submit(GuestLink link, ErmcControl control, CoordMap map)
         {
-            if (_disabled) return false;
+            _nowMs = link.NowMs;
+            if (_disabled)
+            {
+                if (_hardDisabled || _nowMs < _retryAtMs) return false;
+                _disabled = false;       // back-off elapsed: try again
+                _errors = 0;
+                _lastRetryMs = _nowMs;
+                Plugin.Log.LogInfo("Frame capture: retrying after back-off.");
+            }
             try
             {
                 if (!EnsureFrames()) return false;
-                long now = link.NowMs;
+                long now = _nowMs;
                 if (!EnsureRig(link, now)) return false;
                 _lastSubmitMs = now;
 
@@ -171,6 +185,7 @@ namespace UltraRing.Ultrakill.Render
         {
             if (_disabled) return;
             long now = link.NowMs;
+            _nowMs = now;
             try
             {
                 while (_queue.Count > 0)
@@ -191,6 +206,7 @@ namespace UltraRing.Ultrakill.Render
                     {
                         _queue.Dequeue();
                         j.Cancelled = true;     // stays in use until its callbacks fire
+                        j.CancelledMs = now;
                         OnError("readback timed out");
                     }
                     else break;
@@ -200,6 +216,8 @@ namespace UltraRing.Ultrakill.Render
                 if (_haveLast && now - _lastControlMs >= KeepAliveMs && now - _lastSubmitMs < 500)
                 {
                     ErmcControl c = _lastControl;
+                    // A stale picture must not stay on screen: keep the pose alive but stop compositing.
+                    if (now - _lastLandMs > CompositeStaleMs) c.flags &= ~Protocol.CtrlComposite;
                     link.WriteControl(ref c);
                     _lastControl = c;
                     _lastControlMs = now;
@@ -218,7 +236,6 @@ namespace UltraRing.Ultrakill.Render
             }
         }
 
-        /// <summary>Drop pending captures (control released).</summary>
         /// <summary>Cancel and give ULTRAKILL its HUD, canvas and layers back (host gone); Submit rebuilds the rig.</summary>
         public void ReleaseRig()
         {
@@ -227,23 +244,20 @@ namespace UltraRing.Ultrakill.Render
             _haveHostFrame = false;
         }
 
+        /// <summary>Drop pending captures (control released).</summary>
         public void Cancel()
         {
             foreach (Job j in _queue)
             {
                 j.Cancelled = true;
+                j.CancelledMs = _nowMs;
                 if (j.Remaining == 0) j.InUse = false;
             }
             _queue.Clear();
             _haveLast = false;
         }
 
-        public void Teardown()
-        {
-            Cancel();
-            DestroyRig();
-            _haveHostFrame = false;
-        }
+        public void Teardown() => ReleaseRig();
 
         // ---- setup -------------------------------------------------------------------------------------
 
@@ -258,7 +272,7 @@ namespace UltraRing.Ultrakill.Render
             }
             catch (Exception e)
             {
-                Disable("cannot create frames.shm: " + e.Message);
+                Disable("cannot create frames.shm: " + e.Message, hard: true);
                 return false;
             }
         }
@@ -309,8 +323,20 @@ namespace UltraRing.Ultrakill.Render
 
         private Job FreeJob()
         {
-            foreach (Job j in _pool)
-                if (j != null && !j.InUse) return j;
+            for (int i = 0; i < _pool.Length; i++)
+            {
+                Job j = _pool[i];
+                if (j == null) continue;
+                if (!j.InUse) return j;
+                if (j.Cancelled && _nowMs - j.CancelledMs > ReclaimMs)
+                {
+                    // Callbacks never fired (device lost?). The old buffers may still be written by the GPU, so they
+                    // are leaked on purpose and the slot gets a fresh job.
+                    Plugin.Log.LogWarning("Frame capture: reclaiming a stuck readback job.");
+                    _pool[i] = j = NewJob(j.W, j.H);
+                    return j;
+                }
+            }
             return null;
         }
 
@@ -379,10 +405,20 @@ namespace UltraRing.Ultrakill.Render
             int slot = _frames.BeginSlot(j.W, j.H);
             if (slot < 0) { OnError("bad capture size " + j.W + "x" + j.H); return; }
             long bytes = (long)j.W * j.H * 4;
-            bool ok =
-                _frames.WriteLayer(slot, GuestFrames.LayerWorld, (byte*)NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(j.Buf[0]), bytes, FlipRows, WorldAlpha) &&
-                _frames.WriteLayer(slot, GuestFrames.LayerHand, (byte*)NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(j.Buf[1]), bytes, FlipRows, HandAlpha) &&
-                _frames.WriteLayer(slot, GuestFrames.LayerGui, (byte*)NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(j.Buf[2]), bytes, FlipRows, GuiAlpha);
+            bool ok;
+            try
+            {
+                ok =
+                    _frames.WriteLayer(slot, GuestFrames.LayerWorld, (byte*)NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(j.Buf[0]), bytes, FlipRows, WorldAlpha) &&
+                    _frames.WriteLayer(slot, GuestFrames.LayerHand, (byte*)NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(j.Buf[1]), bytes, FlipRows, HandAlpha) &&
+                    _frames.WriteLayer(slot, GuestFrames.LayerGui, (byte*)NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(j.Buf[2]), bytes, FlipRows, GuiAlpha);
+            }
+            catch (Exception e)
+            {
+                _frames.Abort(slot);   // never leave the slot open (odd)
+                OnError("layer copy threw: " + e.Message);
+                return;
+            }
             if (!ok) { _frames.Abort(slot); OnError("layer copy failed"); return; }
             _frames.FillDepth(slot, 1f);   // v0.1: no depth, everything drawn unoccluded and unlit
             float aspect = (float)j.W / j.H;
@@ -397,6 +433,7 @@ namespace UltraRing.Ultrakill.Render
             _lastControl = c;
             _haveLast = true;
             _lastControlMs = now;
+            _lastLandMs = now;
             _errors = 0;
             _fpsCount++;
         }
@@ -408,12 +445,16 @@ namespace UltraRing.Ultrakill.Render
             if (_errors >= MaxConsecutiveErrors) Disable(why + " (" + _errors + " times in a row)");
         }
 
-        private void Disable(string why)
+        private void Disable(string why, bool hard = false)
         {
             if (_disabled) return;
             _disabled = true;
             _disabledWhy = why;
-            Plugin.Log.LogError("Frame capture disabled for this session: " + why);
+            // A failure right after a retry means the cause is not transient.
+            if (hard || (_lastRetryMs != long.MinValue && _nowMs - _lastRetryMs < RepeatFailureMs)) _hardDisabled = true;
+            _retryAtMs = _nowMs + RetryBackoffMs;
+            Plugin.Log.LogError(_hardDisabled ? "Frame capture disabled for this session: " + why
+                : "Frame capture disabled, retrying in " + RetryBackoffMs / 1000 + " s: " + why);
             try { Teardown(); } catch { }
         }
     }

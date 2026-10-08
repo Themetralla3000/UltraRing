@@ -131,37 +131,6 @@ namespace UltraRing.Link
             c.seq = s + 2;
         }
 
-        /// <summary>Simulation feet for the host's terrain contact sampler (see ErmcCollisionControl).</summary>
-        public void WriteCollision(uint flags, uint zone, float fx, float fy, float fz, float px, float py, float pz,
-            float vx, float vy, float vz)
-        {
-            if (_b == null) return;
-            var p = (ErmcCollisionControl*)(_b + Protocol.OffCollisionControl);
-            uint s = Volatile.Read(ref p->seq) & ~1u;
-            Volatile.Write(ref p->seq, s + 1);
-            Thread.MemoryBarrier();
-            p->flags = flags == 0 ? 0 : flags | 2;   // bit1: full previous feet present
-            p->zone = zone;
-            p->feet[0] = fx; p->feet[1] = fy; p->feet[2] = fz;
-            p->previousFeetX = px; p->previousFeetY = py; p->previousFeetZ = pz;
-            p->velocity[0] = vx; p->velocity[1] = vy; p->velocity[2] = vz;
-            Thread.MemoryBarrier();
-            Volatile.Write(ref p->seq, s + 2);
-        }
-
-        public void WriteEnvironment(uint flags, uint timeRevision, uint dayTicks, uint weatherRevision, uint weather)
-        {
-            if (_b == null) return;
-            var p = (ErmcEnvironment*)(_b + Protocol.OffEnvironment);
-            uint s = Volatile.Read(ref p->seq) & ~1u;
-            Volatile.Write(ref p->seq, s + 1);
-            Thread.MemoryBarrier();
-            p->flags = flags; p->timeRevision = timeRevision; p->dayTicks = dayTicks;
-            p->weatherRevision = weatherRevision; p->weather = weather;
-            Thread.MemoryBarrier();
-            Volatile.Write(ref p->seq, s + 2);
-        }
-
         // ---- header counters ---------------------------------------------------------------
 
         public void BumpGuestHeartbeat()
@@ -300,33 +269,6 @@ namespace UltraRing.Link
             Thread.MemoryBarrier();
             Volatile.Write(ref q->write, write + 1);
             return true;
-        }
-
-        /// <summary>
-        /// Reads the host's latest complete terrain contact table. Returns the count, -2 if unchanged since
-        /// <paramref name="previousSeq"/>, or -1 if nothing consistent is available.
-        /// </summary>
-        public int ReadContacts(ErmcTerrainContact[] output, out ErmcTerrainContactsHeader header, uint previousSeq)
-        {
-            header = default;
-            if (_b == null || !Alive) return -1;
-            var h = (ErmcTerrainContactsHeader*)(_b + Protocol.OffContacts);
-            for (int tries = 0; tries < 8; tries++)
-            {
-                uint seq = Volatile.Read(ref h->seq);
-                if (seq == previousSeq && seq != 0) return -2;
-                if (seq == 0 || (seq & 1) != 0) continue;
-                header = *h;
-                if ((header.valid & 1) == 0) return -1;
-                int headerSize = (header.valid & 2) != 0 ? 40 : 32;
-                int count = (int)header.count;
-                if (count < 0 || count > Protocol.MaxContacts || count > output.Length) return -1;
-                var src = (ErmcTerrainContact*)((byte*)h + headerSize);
-                for (int i = 0; i < count; i++) output[i] = src[i];
-                Thread.MemoryBarrier();
-                if (Volatile.Read(ref h->seq) == seq) return count;
-            }
-            return -1;
         }
 
         public void Dispose()

@@ -83,6 +83,44 @@ namespace UltraRing.Ultrakill
                 "Keep every sampled terrain cell on disk (<ERMC_DIR>/terrain-cache/<zone>/) so revisited areas have collision instantly; cached cells are re-validated in the background.");
 
             DebugOverlay =cfg.Bind("Debug", "Overlay", false, "Show bridge diagnostics on screen (toggle with F9).");
+            Validate();
         }
+
+        /// <summary>Clamps values that would break the bridge (NaN, zero, negative) and logs a warning for each fix.</summary>
+        private static void Validate()
+        {
+            Clamp(MetresPerUnit, 0.05f, 5f, 0.5f);
+            Clamp(HostHpPerUkHp, 0.01f, 100000f, 60f);
+            Clamp(HostDamageScale, 0f, 20f, 1f);
+            Clamp(CaptureScale, 0.25f, 1f, 1f);
+            Clamp(TerrainRadius, 4f, 64f, 24f);
+            Clamp(TerrainCell, 0.25f, 4f, 0.5f);
+            Clamp(TerrainStepHeight, 0.05f, 5f, 0.6f);
+            int fps = TargetFrameRate.Value;
+            if (fps != -1 && (fps < 20 || fps > 1000))
+            {
+                int fixedFps = fps <= 0 ? -1 : Mathf.Clamp(fps, 20, 1000);
+                Warn(TargetFrameRate.Definition.Key, fps, fixedFps);
+                TargetFrameRate.Value = fixedFps;
+            }
+            if (InteractKey.Value == SwitchKey.Value)
+            {
+                var alt = SwitchKey.Value == KeyCode.V ? KeyCode.B : KeyCode.V;
+                Warn(InteractKey.Definition.Key + " (same as SwitchKey)", InteractKey.Value, alt);
+                InteractKey.Value = alt;
+            }
+        }
+
+        private static void Clamp(ConfigEntry<float> e, float min, float max, float fallback)
+        {
+            float v = e.Value;
+            float fixedV = float.IsNaN(v) || float.IsInfinity(v) ? fallback : Mathf.Clamp(v, min, max);
+            if (fixedV == v) return;
+            Warn(e.Definition.Key, v, fixedV);
+            e.Value = fixedV;
+        }
+
+        private static void Warn(string key, object from, object to) =>
+            Plugin.Log?.LogWarning($"Config {key} = {from} is out of range; using {to}.");
     }
 }

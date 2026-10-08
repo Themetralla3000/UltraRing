@@ -49,8 +49,7 @@ namespace UltraRing.Ultrakill.Platform
         // ---- overlay state
         private bool _applied;
         private bool _hidden;
-        private bool _hostWasAvailable;
-        private long _lastAvailableMs, _lastNowMs;
+        private long _lastNowMs;
         private OverlayWindowMode _mode;
         private bool _modeInit;
         private RECT _wantRect;            // what we last asked the window to be
@@ -80,7 +79,6 @@ namespace UltraRing.Ultrakill.Platform
         private long _nextFocusMs;
         private bool _wasDrawNothing = true;
         private bool _everDrove;
-        private bool _lastFocused;
         private string _focusNote = "-";
 
         // ---- cursor
@@ -90,9 +88,6 @@ namespace UltraRing.Ultrakill.Platform
         private bool _failed;
         private int _errors;
         private string _note = "idle";
-
-        /// <summary>True while the overlay styles / owner are applied to ULTRAKILL's window.</summary>
-        public bool OverlayActive => _applied;
 
         public string Status => BuildStatus();
 
@@ -181,7 +176,6 @@ namespace UltraRing.Ultrakill.Platform
 
             int hostPid = link.HostProcessId;
             bool hostPresent = EnsureHostWindow(now, hostPid);
-            if (hostAvailable) _lastAvailableMs = now;
 
             // Apply only once the host is really up; once applied, keep going while its window exists
             // (loading screens stop the heartbeat for seconds).
@@ -189,11 +183,9 @@ namespace UltraRing.Ultrakill.Platform
             if (!want)
             {
                 if (_applied) RestoreNormal(hostPresent ? "host unavailable" : "host window gone");
-                _hostWasAvailable = false;
                 if (!_applied) _note = hostPid == 0 ? "no host" : hostPresent ? "waiting for host heartbeat" : "no host window";
                 return;
             }
-            if (!_hostWasAvailable) { _hostWasAvailable = true; }
 
             if (!_applied)
             {
@@ -569,7 +561,6 @@ namespace UltraRing.Ultrakill.Platform
             }
 
             bool focused = GetForegroundWindow() == _hwnd;
-            _lastFocused = focused;
             if (focused && !drawNothing && !_hidden) KeepCursorInside();
             UpdateTaskbarMark(now, force: false);
         }

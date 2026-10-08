@@ -13,7 +13,7 @@ namespace UltraRing.Ultrakill
     {
         public const string Guid = "dev.ultraring.ultrakill";
         public const string Name = "UltraRing";
-        public const string Version = "0.1.0";
+        public const string Version = "0.2.0";
 
         internal static ManualLogSource Log;
 
